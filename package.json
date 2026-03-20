@@ -1,0 +1,39 @@
+{
+  "name": "shihfu-api",
+  "version": "1.0.0",
+  "description": "Shih-Fu CRM+ Backend API — Retention-first operating system for Indian service businesses",
+  "main": "src/server.js",
+  "scripts": {
+    "start":       "node src/server.js",
+    "dev":         "nodemon src/server.js",
+    "migrate":     "node migrations/run.js",
+    "migrate:down":"node migrations/run.js down",
+    "seed":        "node seeds/run.js",
+    "test":        "jest --runInBand"
+  },
+  "dependencies": {
+    "express":          "^4.18.2",
+    "pg":               "^8.11.3",
+    "dotenv":           "^16.3.1",
+    "bcryptjs":         "^2.4.3",
+    "jsonwebtoken":     "^9.0.2",
+    "joi":              "^17.11.0",
+    "cors":             "^2.8.5",
+    "helmet":           "^7.1.0",
+    "morgan":           "^1.10.0",
+    "express-rate-limit":"^7.1.5",
+    "node-cron":        "^3.0.3",
+    "twilio":           "^4.20.0",
+    "nodemailer":       "^6.9.7",
+    "date-fns":         "^3.0.6",
+    "uuid":             "^9.0.0",
+    "winston":          "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "jest":    "^29.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
