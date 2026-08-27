@@ -165,16 +165,16 @@ async function seed() {
         service_category: 'vaccination', remind_after_days: 350,
         whatsapp_template: 'Namaste {customer_name}, {pet_name} ki annual vaccination ka samay aa raha hai. {business_name} mein appointment book karein.',
         sms_template: 'Dear {customer_name}, {pet_name}\'s annual vaccination is due on {due_date}. Call {business_name} to book: reply BOOK',
-        email_subject: '{pet_name}\'s Annual Vaccination Due — {business_name}',
+        email_subject: '{pet_name}\'s Annual Vaccination Due - {business_name}',
         email_body: 'Dear {customer_name},\n\nThis is a reminder that {pet_name}\'s annual vaccination is due on {due_date}.\n\nPlease call us to schedule an appointment.\n\nRegards,\n{business_name}',
         followup_after_days: 7,
       },
       {
         name: 'Grooming Cycle Reminder',
         service_category: 'grooming', remind_after_days: 18,
-        whatsapp_template: 'Hi {customer_name}! {pet_name} ki grooming appointment book karein — {business_name}.',
+        whatsapp_template: 'Hi {customer_name}! {pet_name} ki grooming appointment book karein - {business_name}.',
         sms_template: 'Hi {customer_name}, time to book {pet_name}\'s grooming at {business_name}. Reply BOOK.',
-        email_subject: 'Time for {pet_name}\'s Grooming — {business_name}',
+        email_subject: 'Time for {pet_name}\'s Grooming - {business_name}',
         email_body: 'Dear {customer_name},\n\nIt\'s been a few weeks since {pet_name}\'s last grooming session.\n\nBook an appointment with us today.\n\nRegards,\n{business_name}',
       },
       {
@@ -182,7 +182,7 @@ async function seed() {
         service_category: 'deworming', remind_after_days: 85,
         whatsapp_template: 'Namaste {customer_name}! {pet_name} ke deworming ka samay ho gaya hai. {business_name} se sampark karein.',
         sms_template: 'Dear {customer_name}, {pet_name}\'s deworming is due. Book at {business_name}.',
-        email_subject: '{pet_name} — Deworming Due | {business_name}',
+        email_subject: '{pet_name} - Deworming Due | {business_name}',
         email_body: 'Dear {customer_name},\n\n{pet_name}\'s quarterly deworming is due.\n\nRegards,\n{business_name}',
       },
     ];

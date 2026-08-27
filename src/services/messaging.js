@@ -137,7 +137,7 @@ async function sendEmail(reminder) {
   const info = await transporter.sendMail({
     from:    `"${SMTP_FROM_NAME}" <${SMTP_FROM_EMAIL}>`,
     to:      reminder.email,
-    subject: reminder.message_subject || `Service Reminder — ${reminder.reminder_type}`,
+    subject: reminder.message_subject || `Service Reminder - ${reminder.reminder_type}`,
     text:    reminder.message_body,
     html:    buildEmailHtml(reminder),
   });
