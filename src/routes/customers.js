@@ -10,6 +10,54 @@ const router = express.Router();
 // All routes require authentication
 router.use(authenticate);
 
+// ─── Retention date helpers ────────────────────────────────────────
+// retentionData is a free-form { fieldKey: value } map (see
+// lib/industry-config.js on the frontend). Only the date-typed fields
+// (values shaped like an <input type="date"> — "YYYY-MM-DD") represent
+// an actual due date, so those are the only ones that schedule a
+// reminder; select/text fields (e.g. "Recurring Schedule": "Weekly")
+// are stored but don't drive automation.
+const DATE_VALUE = /^\d{4}-\d{2}-\d{2}$/;
+
+function labelize(key) {
+  return key.replace(/([A-Z])/g, ' $1').replace(/^./, c => c.toUpperCase()).trim();
+}
+
+// Upserts one scheduled reminder per date-valued retention field.
+// Existing scheduled reminders of the same type get their date moved;
+// nothing is touched for fields that are blank or already sent.
+//
+// message_log.message_body is NOT NULL, so every reminder needs real
+// text up front — a reminder created without one will send-then-throw
+// the moment someone clicks Send Now (status flips to 'sent' but the
+// message_log insert fails on the constraint, leaving it stuck with no
+// audit trail and no message ever actually dispatched).
+async function syncRetentionReminders(client, { businessId, customerId, entityId, preferredChannel, customerName, entityName, retentionData }) {
+  for (const [key, value] of Object.entries(retentionData || {})) {
+    if (typeof value !== 'string' || !DATE_VALUE.test(value)) continue;
+    const reminderType = labelize(key);
+    const messageBody = `Hi ${customerName}, a reminder that ${entityName ? `${entityName}'s ` : 'your '}${reminderType.toLowerCase()} is coming up on ${value}. Please contact us to schedule.`;
+
+    const { rows: [existing] } = await client.query(`
+      SELECT id, scheduled_at::DATE::TEXT AS scheduled_date FROM reminders
+      WHERE customer_id = $1 AND entity_id = $2 AND reminder_type = $3 AND status = 'scheduled'
+      LIMIT 1
+    `, [customerId, entityId, reminderType]);
+
+    if (existing) {
+      if (existing.scheduled_date !== value) {
+        await client.query(`UPDATE reminders SET scheduled_at = $1, message_body = $2 WHERE id = $3`, [value, messageBody, existing.id]);
+      }
+    } else {
+      await client.query(`
+        INSERT INTO reminders
+          (business_id, customer_id, entity_id, reminder_type, channel, scheduled_at, status, message_body)
+        VALUES ($1,$2,$3,$4,$5,$6,'scheduled',$7)
+      `, [businessId, customerId, entityId, reminderType, preferredChannel || 'whatsapp', value, messageBody]);
+    }
+  }
+}
+
 // ─── GET /customers ───────────────────────────────────────────────
 // Paginated list with search, filter, sort
 router.get('/', validate(schemas.listQuery, 'query'), async (req, res) => {
@@ -96,37 +144,43 @@ router.post('/', validate(schemas.createCustomer), async (req, res) => {
     const result = await withTransaction(async (client) => {
       const { rows: [customer] } = await client.query(`
         INSERT INTO customers
-          (business_id, name, phone, email, city, state, pincode,
+          (business_id, name, phone, email, city, address, state, pincode,
            preferred_channel, opted_in_sms, opted_in_whatsapp, opted_in_email,
            opted_in_at, tags, notes, source, external_id, created_by, status)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-                CASE WHEN ($9 OR $10 OR $11) THEN NOW() ELSE NULL END,
-                $12,$13,$14,$15,$16,'active')
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                CASE WHEN ($10 OR $11 OR $12) THEN NOW() ELSE NULL END,
+                $13,$14,$15,$16,$17,'active')
         RETURNING *
       `, [
         businessId, customerData.name, customerData.phone, customerData.email || null,
-        customerData.city || null, customerData.state || null, customerData.pincode || null,
+        customerData.city || null, customerData.address || null,
+        customerData.state || null, customerData.pincode || null,
         customerData.preferredChannel, customerData.optedInSms, customerData.optedInWhatsapp,
         customerData.optedInEmail, customerData.tags || null, customerData.notes || null,
         customerData.source, customerData.externalId || null, req.user.staffId,
       ]);
 
       let entityRow = null;
-      if (entity?.name || entity?.entityType) {
+      if (entity?.name || entity?.entityType || Object.keys(entity?.assetData || {}).length) {
         const { rows: [e] } = await client.query(`
           INSERT INTO customer_entities
-            (customer_id, business_id, name, entity_type, breed_or_model,
-             dob_or_year, gender, registration_no, insurance_expiry, notes)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            (customer_id, business_id, name, entity_type, asset_data, retention_data)
+          VALUES ($1,$2,$3,$4,$5,$6)
           RETURNING *
         `, [
           customer.id, businessId, entity.name || null,
-          entity.entityType || 'other', entity.breedOrModel || null,
-          entity.dobOrYear || null, entity.gender || null,
-          entity.registrationNo || null, entity.insuranceExpiry || null,
-          entity.notes || null,
+          entity.entityType || 'other',
+          JSON.stringify(entity.assetData || {}),
+          JSON.stringify(entity.retentionData || {}),
         ]);
         entityRow = e;
+
+        await syncRetentionReminders(client, {
+          businessId, customerId: customer.id, entityId: e.id,
+          preferredChannel: customer.preferred_channel,
+          customerName: customer.name, entityName: e.name,
+          retentionData: entity.retentionData,
+        });
       }
 
       return { customer, entity: entityRow };
@@ -173,41 +227,106 @@ router.get('/:id', async (req, res) => {
 router.patch('/:id', validate(schemas.updateCustomer), async (req, res) => {
   const { id } = req.params;
   const businessId = req.user.businessId;
-  const updates = req.body;
+  const { entity, ...updates } = req.body;
+
+  const hasEntityData = entity && (
+    entity.name || entity.entityType ||
+    Object.keys(entity.assetData || {}).length ||
+    Object.keys(entity.retentionData || {}).length
+  );
+
+  // Build dynamic SET clause (snake_case mapping)
+  const colMap = {
+    name:'name', phone:'phone', email:'email', city:'city', address:'address',
+    state:'state', pincode:'pincode',
+    preferredChannel:'preferred_channel', optedInSms:'opted_in_sms',
+    optedInWhatsapp:'opted_in_whatsapp', optedInEmail:'opted_in_email',
+    tags:'tags', notes:'notes', status:'status',
+  };
+
+  const setClauses = [];
+  const params     = [];
+  let p = 1;
+
+  for (const field of Object.keys(updates)) {
+    const col = colMap[field];
+    if (col) { setClauses.push(`${col} = $${p++}`); params.push(updates[field]); }
+  }
+
+  if (!setClauses.length && !hasEntityData) return R.badRequest(res, 'No valid fields to update');
 
   try {
-    const fields = Object.keys(updates);
-    if (!fields.length) return R.badRequest(res, 'No fields provided to update');
+    const result = await withTransaction(async (client) => {
+      let customer;
+      if (setClauses.length) {
+        params.push(id, businessId);
+        const { rows } = await client.query(`
+          UPDATE customers SET ${setClauses.join(', ')}
+          WHERE id = $${p++} AND business_id = $${p}
+          RETURNING *
+        `, params);
+        customer = rows[0];
+      } else {
+        const { rows } = await client.query(
+          'SELECT * FROM customers WHERE id = $1 AND business_id = $2', [id, businessId]
+        );
+        customer = rows[0];
+      }
+      if (!customer) return null;
 
-    // Build dynamic SET clause (snake_case mapping)
-    const colMap = {
-      name:'name', email:'email', city:'city', state:'state', pincode:'pincode',
-      preferredChannel:'preferred_channel', optedInSms:'opted_in_sms',
-      optedInWhatsapp:'opted_in_whatsapp', optedInEmail:'opted_in_email',
-      tags:'tags', notes:'notes', status:'status',
-    };
+      if (hasEntityData) {
+        const { rows: [existingEntity] } = await client.query(`
+          SELECT id FROM customer_entities
+          WHERE customer_id = $1 AND is_active = true
+          ORDER BY created_at ASC LIMIT 1
+        `, [id]);
 
-    const setClauses = [];
-    const params     = [];
-    let p = 1;
+        let entityRow;
+        if (existingEntity) {
+          const { rows: [e] } = await client.query(`
+            UPDATE customer_entities
+            SET name = COALESCE($1, name),
+                entity_type = COALESCE($2, entity_type),
+                asset_data = $3,
+                retention_data = $4
+            WHERE id = $5
+            RETURNING *
+          `, [
+            entity.name || null, entity.entityType || null,
+            JSON.stringify(entity.assetData || {}),
+            JSON.stringify(entity.retentionData || {}),
+            existingEntity.id,
+          ]);
+          entityRow = e;
+        } else {
+          const { rows: [e] } = await client.query(`
+            INSERT INTO customer_entities
+              (customer_id, business_id, name, entity_type, asset_data, retention_data)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            RETURNING *
+          `, [
+            id, businessId, entity.name || null, entity.entityType || 'other',
+            JSON.stringify(entity.assetData || {}),
+            JSON.stringify(entity.retentionData || {}),
+          ]);
+          entityRow = e;
+        }
 
-    for (const field of fields) {
-      const col = colMap[field];
-      if (col) { setClauses.push(`${col} = $${p++}`); params.push(updates[field]); }
-    }
+        await syncRetentionReminders(client, {
+          businessId, customerId: id, entityId: entityRow.id,
+          preferredChannel: customer.preferred_channel,
+          customerName: customer.name, entityName: entityRow.name,
+          retentionData: entity.retentionData,
+        });
+      }
 
-    if (!setClauses.length) return R.badRequest(res, 'No valid fields to update');
+      return customer;
+    });
 
-    params.push(id, businessId);
-    const { rows } = await query(`
-      UPDATE customers SET ${setClauses.join(', ')}
-      WHERE id = $${p++} AND business_id = $${p}
-      RETURNING *
-    `, params);
-
-    if (!rows.length) return R.notFound(res, 'Customer not found');
-    return R.success(res, rows[0], 'Customer updated');
+    if (!result) return R.notFound(res, 'Customer not found');
+    return R.success(res, result, 'Customer updated');
   } catch (err) {
+    if (err.code === '23505') return R.conflict(res, 'A customer with this phone number already exists');
     logger.error('Update customer error', { error: err.message, id });
     return R.error(res);
   }

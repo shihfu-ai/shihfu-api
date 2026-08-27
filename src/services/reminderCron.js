@@ -3,7 +3,7 @@
 // Uses node-cron. Called once at server startup.
 
 const cron     = require('node-cron');
-const { query } = require('../../config/database');
+const { query, withTransaction } = require('../../config/database');
 const messagingService = require('./messaging');
 const logger   = require('../utils/logger');
 
@@ -77,31 +77,36 @@ async function processduedReminders() {
         continue;
       }
 
-      // Dispatch message
-      const result = await messagingService.send(reminder);
+      // Dispatch message — message_log.message_body is NOT NULL, so a
+      // reminder created without one falls back to a generic line rather
+      // than marking itself 'sent' and then throwing on the log insert.
+      const messageBody = reminder.message_body
+        || `Hi ${reminder.customer_name}, this is a reminder regarding your ${reminder.reminder_type}. Please contact us to schedule.`;
+      const result = await messagingService.send({ ...reminder, message_body: messageBody });
 
       if (result.success) {
-        await query(`
-          UPDATE reminders
-          SET status = 'sent', sent_at = NOW(),
-              attempt_count = attempt_count + 1,
-              last_attempt_at = NOW(),
-              twilio_sid = $1, whatsapp_msg_id = $2, email_msg_id = $3
-          WHERE id = $4
-        `, [result.twilioSid || null, result.whatsappMsgId || null, result.emailMsgId || null, reminder.id]);
+        await withTransaction(async (client) => {
+          await client.query(`
+            UPDATE reminders
+            SET status = 'sent', sent_at = NOW(),
+                attempt_count = attempt_count + 1,
+                last_attempt_at = NOW(),
+                twilio_sid = $1, whatsapp_msg_id = $2, email_msg_id = $3
+            WHERE id = $4
+          `, [result.twilioSid || null, result.whatsappMsgId || null, result.emailMsgId || null, reminder.id]);
 
-        // Append to message_log
-        await query(`
-          INSERT INTO message_log
-            (business_id, customer_id, reminder_id, channel, recipient,
-             message_body, provider, provider_msg_id, status, consent_verified)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sent',true)
-        `, [
-          reminder.business_id, reminder.customer_id, reminder.id,
-          reminder.channel,
-          reminder.channel === 'email' ? reminder.email : reminder.phone,
-          reminder.message_body, result.provider, result.providerId,
-        ]);
+          await client.query(`
+            INSERT INTO message_log
+              (business_id, customer_id, reminder_id, channel, recipient,
+               message_body, provider, provider_msg_id, status, consent_verified)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sent',true)
+          `, [
+            reminder.business_id, reminder.customer_id, reminder.id,
+            reminder.channel,
+            reminder.channel === 'email' ? reminder.email : reminder.phone,
+            messageBody, result.provider, result.providerId,
+          ]);
+        });
 
         sent++;
       } else {

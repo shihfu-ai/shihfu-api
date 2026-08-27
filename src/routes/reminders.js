@@ -139,36 +139,43 @@ router.post('/:id/send', async (req, res) => {
       return R.badRequest(res, 'Reminder already sent');
     }
 
-    const sendResult = await messagingService.send(reminder);
+    // message_log.message_body is NOT NULL — a reminder created without
+    // one (e.g. a manual POST /reminders with no messageBody) would
+    // otherwise mark itself 'sent' and then throw on the log insert,
+    // leaving it stuck sent with no record of what was (or wasn't) sent.
+    const messageBody = reminder.message_body
+      || `Hi ${reminder.customer_name}, this is a reminder regarding your ${reminder.reminder_type}. Please contact us to schedule.`;
 
-    // Update reminder record
-    await query(`
-      UPDATE reminders
-      SET status = $1, sent_at = NOW(), attempt_count = attempt_count + 1,
-          last_attempt_at = NOW(),
-          twilio_sid = $2, whatsapp_msg_id = $3, email_msg_id = $4
-      WHERE id = $5
-    `, [
-      sendResult.success ? 'sent' : 'failed',
-      sendResult.twilioSid || null,
-      sendResult.whatsappMsgId || null,
-      sendResult.emailMsgId || null,
-      id,
-    ]);
+    const sendResult = await messagingService.send({ ...reminder, message_body: messageBody });
 
-    // Log to message_log
-    await query(`
-      INSERT INTO message_log
-        (business_id, customer_id, reminder_id, channel, recipient,
-         message_body, provider, provider_msg_id, status, consent_verified)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, true)
-    `, [
-      businessId, reminder.customer_id, id, reminder.channel,
-      reminder.channel === 'email' ? reminder.email : reminder.phone,
-      reminder.message_body,
-      sendResult.provider, sendResult.providerId,
-      sendResult.success ? 'sent' : 'failed',
-    ]);
+    await withTransaction(async (client) => {
+      await client.query(`
+        UPDATE reminders
+        SET status = $1, sent_at = NOW(), attempt_count = attempt_count + 1,
+            last_attempt_at = NOW(),
+            twilio_sid = $2, whatsapp_msg_id = $3, email_msg_id = $4
+        WHERE id = $5
+      `, [
+        sendResult.success ? 'sent' : 'failed',
+        sendResult.twilioSid || null,
+        sendResult.whatsappMsgId || null,
+        sendResult.emailMsgId || null,
+        id,
+      ]);
+
+      await client.query(`
+        INSERT INTO message_log
+          (business_id, customer_id, reminder_id, channel, recipient,
+           message_body, provider, provider_msg_id, status, consent_verified)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, true)
+      `, [
+        businessId, reminder.customer_id, id, reminder.channel,
+        reminder.channel === 'email' ? reminder.email : reminder.phone,
+        messageBody,
+        sendResult.provider, sendResult.providerId,
+        sendResult.success ? 'sent' : 'failed',
+      ]);
+    });
 
     if (!sendResult.success) {
       return R.error(res, `Message delivery failed: ${sendResult.error}`, 502);
@@ -203,13 +210,30 @@ router.post('/send-overdue', authorize('owner', 'manager'), async (req, res) => 
 
     let sent = 0, failed = 0;
     for (const reminder of overdue) {
-      const result = await messagingService.send(reminder);
-      await query(`
-        UPDATE reminders
-        SET status = $1, sent_at = CASE WHEN $2 THEN NOW() ELSE sent_at END,
-            attempt_count = attempt_count + 1, last_attempt_at = NOW()
-        WHERE id = $3
-      `, [result.success ? 'sent' : 'failed', result.success, reminder.id]);
+      const messageBody = reminder.message_body
+        || `Hi ${reminder.customer_name}, this is a reminder regarding your ${reminder.reminder_type}. Please contact us to schedule.`;
+      const result = await messagingService.send({ ...reminder, message_body: messageBody });
+
+      await withTransaction(async (client) => {
+        await client.query(`
+          UPDATE reminders
+          SET status = $1, sent_at = CASE WHEN $2 THEN NOW() ELSE sent_at END,
+              attempt_count = attempt_count + 1, last_attempt_at = NOW()
+          WHERE id = $3
+        `, [result.success ? 'sent' : 'failed', result.success, reminder.id]);
+
+        await client.query(`
+          INSERT INTO message_log
+            (business_id, customer_id, reminder_id, channel, recipient,
+             message_body, provider, provider_msg_id, status, consent_verified)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, true)
+        `, [
+          businessId, reminder.customer_id, reminder.id, reminder.channel,
+          reminder.channel === 'email' ? reminder.email : reminder.phone,
+          messageBody, result.provider, result.providerId,
+          result.success ? 'sent' : 'failed',
+        ]);
+      });
 
       result.success ? sent++ : failed++;
     }

@@ -59,6 +59,7 @@ const schemas = {
     phone:            indianPhone.required(),
     email:            Joi.string().email().allow('', null),
     city:             Joi.string().max(60).allow('', null),
+    address:          Joi.string().max(255).allow('', null),
     state:            Joi.string().max(60).allow('', null),
     pincode:          Joi.string().pattern(/^\d{6}$/).allow('', null),
     preferredChannel: Joi.string().valid(...channels).default('whatsapp'),
@@ -69,23 +70,23 @@ const schemas = {
     notes:            Joi.string().max(1000).allow('', null),
     source:           Joi.string().valid('manual', 'import', 'qr', 'pos', 'web').default('manual'),
     externalId:       Joi.string().max(100).allow('', null),
-    // Pet / entity
+    // Pet / vehicle / other serviced entity — the actual field set is
+    // driven by lib/industry-config.js on the frontend and varies per
+    // business vertical, so assetData/retentionData are open-ended maps.
     entity: Joi.object({
-      name:          Joi.string().max(100),
-      entityType:    Joi.string().valid('dog','cat','bird','rabbit','other_animal','car','two_wheeler','commercial_vehicle','person','other'),
-      breedOrModel:  Joi.string().max(120),
-      dobOrYear:     Joi.string().max(20),
-      gender:        Joi.string().valid('male','female','unknown').allow('', null),
-      registrationNo: Joi.string().max(20).allow('', null),
-      insuranceExpiry: Joi.date().allow(null),
-      notes:         Joi.string().max(500).allow('', null),
+      name:          Joi.string().max(100).allow('', null),
+      entityType:    Joi.string().max(30).allow('', null),
+      assetData:     Joi.object().unknown(true),
+      retentionData: Joi.object().unknown(true),
     }),
   }),
 
   updateCustomer: Joi.object({
     name:             Joi.string().min(2).max(120),
+    phone:            indianPhone,
     email:            Joi.string().email().allow('', null),
     city:             Joi.string().max(60).allow('', null),
+    address:          Joi.string().max(255).allow('', null),
     state:            Joi.string().max(60).allow('', null),
     pincode:          Joi.string().pattern(/^\d{6}$/).allow('', null),
     preferredChannel: Joi.string().valid(...channels),
@@ -95,6 +96,12 @@ const schemas = {
     tags:             Joi.array().items(Joi.string().max(30)).max(10),
     notes:            Joi.string().max(1000).allow('', null),
     status:           Joi.string().valid('active','dormant','lost','opted_out'),
+    entity: Joi.object({
+      name:          Joi.string().max(100).allow('', null),
+      entityType:    Joi.string().max(30).allow('', null),
+      assetData:     Joi.object().unknown(true),
+      retentionData: Joi.object().unknown(true),
+    }),
   }),
 
   // Service events
