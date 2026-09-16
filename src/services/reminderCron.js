@@ -33,9 +33,11 @@ async function processduedReminders() {
       r.channel, r.scheduled_at, r.message_body, r.message_subject,
       r.attempt_count,
       c.name AS customer_name, c.phone, c.email,
-      e.name AS entity_name
+      e.name AS entity_name,
+      b.name AS business_name, b.email AS business_email
     FROM reminders r
     JOIN customers c ON c.id = r.customer_id
+    JOIN businesses b ON b.id = r.business_id
     LEFT JOIN customer_entities e ON e.id = r.entity_id
     WHERE r.status = 'scheduled'
       AND r.scheduled_at <= NOW()
@@ -82,7 +84,7 @@ async function processduedReminders() {
       // than marking itself 'sent' and then throwing on the log insert.
       const messageBody = reminder.message_body
         || `Hi ${reminder.customer_name}, this is a reminder regarding your ${reminder.reminder_type}. Please contact us to schedule.`;
-      const result = await messagingService.send({ ...reminder, message_body: messageBody });
+      const result = await messagingService.send({ ...reminder, message_body: messageBody, category: 'utility' });
 
       if (result.success) {
         await withTransaction(async (client) => {

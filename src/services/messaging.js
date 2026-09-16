@@ -13,7 +13,16 @@ const logger = require('../utils/logger');
 // Main dispatch function
 // reminder shape: { id, channel, phone, email, customer_name,
 //                   entity_name, reminder_type, message_body,
-//                   message_subject, business_id }
+//                   message_subject, business_id,
+//                   category: 'utility' | 'marketing' }
+//
+// `category` matters for WhatsApp only: Meta requires a pre-approved
+// message template for any business-initiated message sent outside a
+// 24-hour window since the customer last messaged this business — which
+// covers essentially every reminder and campaign this app sends. Utility
+// (service reminders) and marketing (festival/promo campaigns) templates
+// are approved and reviewed separately by Meta, so callers must say
+// which kind of message this is.
 // ─────────────────────────────────────────────────────────────────
 async function send(reminder) {
   const { channel } = reminder;
@@ -37,7 +46,7 @@ async function send(reminder) {
 // WhatsApp — Meta Business API (official)
 // ─────────────────────────────────────────────────────────────────
 async function sendWhatsApp(reminder) {
-  const { WHATSAPP_API_URL, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN } = process.env;
+  const { WHATSAPP_API_URL, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN, WHATSAPP_TEMPLATE_LANG } = process.env;
 
   if (!WHATSAPP_ACCESS_TOKEN) {
     logger.warn('WhatsApp not configured — skipping (dev mode)');
@@ -47,13 +56,37 @@ async function sendWhatsApp(reminder) {
   // Format phone to E.164: 10-digit Indian → +91XXXXXXXXXX
   const toPhone = formatIndianPhone(reminder.phone);
 
-  const body = {
-    messaging_product: 'whatsapp',
-    recipient_type:    'individual',
-    to:                toPhone,
-    type:              'text',
-    text:              { body: reminder.message_body },
-  };
+  const templateName = reminder.category === 'marketing'
+    ? process.env.WHATSAPP_TEMPLATE_NAME_MARKETING
+    : process.env.WHATSAPP_TEMPLATE_NAME_UTILITY;
+
+  let body;
+  if (templateName) {
+    // Business-initiated message outside the 24h customer service window
+    // (true for essentially every reminder/campaign send) — must use an
+    // approved template. The whole freeform message is passed as the
+    // template's single body variable, so the template itself just needs
+    // one {{1}} placeholder (e.g. "{{1}}" as its entire body).
+    body = {
+      messaging_product: 'whatsapp',
+      to:   toPhone,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: WHATSAPP_TEMPLATE_LANG || 'en' },
+        components: [{ type: 'body', parameters: [{ type: 'text', text: (reminder.message_body || '').slice(0, 1024) }] }],
+      },
+    };
+  } else {
+    logger.warn('No WhatsApp template configured for this message category — sending freeform text, which Meta rejects outside a 24h customer-initiated window', { category: reminder.category || 'utility' });
+    body = {
+      messaging_product: 'whatsapp',
+      recipient_type:    'individual',
+      to:                toPhone,
+      type:              'text',
+      text:              { body: reminder.message_body },
+    };
+  }
 
   const response = await fetch(
     `${WHATSAPP_API_URL}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
@@ -134,8 +167,15 @@ async function sendEmail(reminder) {
     auth:   { user: SMTP_USER, pass: SMTP_PASS },
   });
 
+  // Sent through one authenticated Shih-Fu sending domain (so SPF/DKIM
+  // pass and mail doesn't land in spam), but the visible From name is
+  // the business's own name and Reply-To is their real signup email —
+  // so customers see and can respond to the business, not "Shih-Fu".
+  const fromName = reminder.business_name || SMTP_FROM_NAME || 'Shih-Fu Notifications';
+
   const info = await transporter.sendMail({
-    from:    `"${SMTP_FROM_NAME}" <${SMTP_FROM_EMAIL}>`,
+    from:    `"${fromName}" <${SMTP_FROM_EMAIL}>`,
+    replyTo: reminder.business_email || undefined,
     to:      reminder.email,
     subject: reminder.message_subject || `Service Reminder - ${reminder.reminder_type}`,
     text:    reminder.message_body,
@@ -149,6 +189,10 @@ async function sendEmail(reminder) {
 // ─────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
 function formatIndianPhone(phone) {
   const digits = phone.replace(/\D/g, '');
   if (digits.length === 10) return `+91${digits}`;
@@ -170,7 +214,7 @@ function buildEmailHtml(reminder) {
         <tr>
           <td style="background:#0d0d0d;padding:20px 32px">
             <span style="font-family:Georgia,serif;font-size:1.3rem;color:#f5f0e8;font-weight:700">
-              Shih-Fu <span style="color:#c8a84b">Reminders</span>
+              ${escapeHtml(reminder.business_name || 'Shih-Fu')}
             </span>
           </td>
         </tr>

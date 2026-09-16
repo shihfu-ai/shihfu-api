@@ -41,6 +41,8 @@ function startCampaignCron() {
 async function dispatchCampaign(campaign) {
   await query(`UPDATE campaigns SET status = 'sending' WHERE id = $1`, [campaign.id]);
 
+  const { rows: [business] } = await query(`SELECT name, email FROM businesses WHERE id = $1`, [campaign.business_id]);
+
   const { rows: customers } = await query(`
     SELECT id, name, phone, email, preferred_channel,
            opted_in_whatsapp, opted_in_sms, opted_in_email
@@ -64,8 +66,10 @@ async function dispatchCampaign(campaign) {
       id: campaign.id, channel,
       phone: customer.phone, email: customer.email,
       customer_name: customer.name,
+      business_name: business?.name, business_email: business?.email,
       message_body: campaign.message_body,
       message_subject: campaign.label,
+      category: 'marketing',
     });
 
     await withTransaction(async (client) => {

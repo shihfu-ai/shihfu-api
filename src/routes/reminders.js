@@ -125,9 +125,11 @@ router.post('/:id/send', async (req, res) => {
   try {
     const { rows } = await query(`
       SELECT r.*, c.name AS customer_name, c.phone, c.email,
-             e.name AS entity_name
+             e.name AS entity_name,
+             b.name AS business_name, b.email AS business_email
       FROM reminders r
       JOIN customers c ON c.id = r.customer_id
+      JOIN businesses b ON b.id = r.business_id
       LEFT JOIN customer_entities e ON e.id = r.entity_id
       WHERE r.id = $1 AND r.business_id = $2
     `, [id, businessId]);
@@ -146,7 +148,7 @@ router.post('/:id/send', async (req, res) => {
     const messageBody = reminder.message_body
       || `Hi ${reminder.customer_name}, this is a reminder regarding your ${reminder.reminder_type}. Please contact us to schedule.`;
 
-    const sendResult = await messagingService.send({ ...reminder, message_body: messageBody });
+    const sendResult = await messagingService.send({ ...reminder, message_body: messageBody, category: 'utility' });
 
     await withTransaction(async (client) => {
       await client.query(`
@@ -195,9 +197,11 @@ router.post('/send-overdue', authorize('owner', 'manager'), async (req, res) => 
 
   try {
     const { rows: overdue } = await query(`
-      SELECT r.*, c.name AS customer_name, c.phone, c.email
+      SELECT r.*, c.name AS customer_name, c.phone, c.email,
+             b.name AS business_name, b.email AS business_email
       FROM reminders r
       JOIN customers c ON c.id = r.customer_id
+      JOIN businesses b ON b.id = r.business_id
       WHERE r.business_id = $1
         AND r.status = 'scheduled'
         AND r.scheduled_at < NOW()
@@ -212,7 +216,7 @@ router.post('/send-overdue', authorize('owner', 'manager'), async (req, res) => 
     for (const reminder of overdue) {
       const messageBody = reminder.message_body
         || `Hi ${reminder.customer_name}, this is a reminder regarding your ${reminder.reminder_type}. Please contact us to schedule.`;
-      const result = await messagingService.send({ ...reminder, message_body: messageBody });
+      const result = await messagingService.send({ ...reminder, message_body: messageBody, category: 'utility' });
 
       await withTransaction(async (client) => {
         await client.query(`
