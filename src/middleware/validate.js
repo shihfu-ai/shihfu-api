@@ -136,6 +136,19 @@ const schemas = {
     messageSubject:Joi.string().max(200).allow('', null),
   }),
 
+  // Campaigns — bulk messages to the whole customer base (festival /
+  // promo blasts), sent immediately or scheduled for a future date.
+  createCampaign: Joi.object({
+    label:       Joi.string().min(2).max(120).required(),
+    messageBody: Joi.string().min(1).max(1000).required(),
+    channels:    Joi.array().items(Joi.string().valid(...channels)).min(1).required(),
+    // No .min('now') here: a "Send Now" timestamp is captured client-side
+    // and is always a little in the past by the time it reaches this
+    // validator, which would reject every immediate send. The route
+    // treats anything scheduled within the last/next minute as "due now".
+    scheduledAt: Joi.date().required(),
+  }),
+
   // Query params
   listQuery: Joi.object({
     page:     Joi.number().integer().min(1).default(1),

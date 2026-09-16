@@ -13,6 +13,7 @@ const logger   = require('./utils/logger');
 const R        = require('./utils/response');
 const { pool } = require('../config/database');
 const { startReminderCron } = require('./services/reminderCron');
+const { startCampaignCron } = require('./services/campaignCron');
 
 // ─── Routes ───────────────────────────────────────────────────────
 const authRoutes         = require('./routes/auth');
@@ -20,6 +21,7 @@ const customerRoutes     = require('./routes/customers');
 const serviceEventRoutes = require('./routes/serviceEvents');
 const reminderRoutes     = require('./routes/reminders');
 const analyticsRoutes    = require('./routes/analytics');
+const campaignRoutes     = require('./routes/campaigns');
 
 const app     = express();
 const VERSION = process.env.API_VERSION || 'v1';
@@ -79,6 +81,7 @@ app.use(`/api/${VERSION}/customers`,      customerRoutes);
 app.use(`/api/${VERSION}/service-events`, serviceEventRoutes);
 app.use(`/api/${VERSION}/reminders`,      reminderRoutes);
 app.use(`/api/${VERSION}/analytics`,      analyticsRoutes);
+app.use(`/api/${VERSION}/campaigns`,      campaignRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
@@ -138,9 +141,10 @@ async function start() {
     });
   });
 
-  // Start scheduled reminder processing
+  // Start scheduled reminder + campaign processing
   if (process.env.NODE_ENV !== 'test') {
     startReminderCron();
+    startCampaignCron();
   }
 }
 
