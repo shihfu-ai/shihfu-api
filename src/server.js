@@ -22,6 +22,7 @@ const serviceEventRoutes = require('./routes/serviceEvents');
 const reminderRoutes     = require('./routes/reminders');
 const analyticsRoutes    = require('./routes/analytics');
 const campaignRoutes     = require('./routes/campaigns');
+const emailAuthRoutes    = require('./routes/emailAuth');
 
 const app     = express();
 const VERSION = process.env.API_VERSION || 'v1';
@@ -82,6 +83,7 @@ app.use(`/api/${VERSION}/service-events`, serviceEventRoutes);
 app.use(`/api/${VERSION}/reminders`,      reminderRoutes);
 app.use(`/api/${VERSION}/analytics`,      analyticsRoutes);
 app.use(`/api/${VERSION}/campaigns`,      campaignRoutes);
+app.use(`/api/${VERSION}/email-auth`,     emailAuthRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────
 app.get('/health', async (req, res) => {

@@ -8,6 +8,8 @@
 //   Email— SMTP (SendGrid / Zoho Mail)
 
 const logger = require('../utils/logger');
+const { query } = require('../../config/database');
+const { encrypt, decrypt } = require('../utils/crypto');
 
 // ─────────────────────────────────────────────────────────────────
 // Main dispatch function
@@ -145,14 +147,86 @@ async function sendSMS(reminder) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Email — Nodemailer (SMTP)
+// Email — the business's own connected Gmail account when they've
+// connected one (private to them, Shih-Fu never reads their inbox),
+// otherwise a shared SMTP relay branded with their name (see
+// sendEmailViaSmtp below).
 // ─────────────────────────────────────────────────────────────────
 async function sendEmail(reminder) {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
-
   if (!reminder.email) {
     return { success: false, error: 'No email address on file for this customer', provider: 'email' };
   }
+
+  if (reminder.business_id) {
+    const viaGmail = await sendEmailViaGmail(reminder);
+    if (viaGmail) return viaGmail;
+  }
+
+  return sendEmailViaSmtp(reminder);
+}
+
+// Sends through the business's own Gmail account via the Gmail API,
+// using the OAuth tokens stored (encrypted) when they connected it in
+// Account Settings. Returns null (not a result) when no connection
+// exists, so the caller falls back to the shared SMTP relay.
+async function sendEmailViaGmail(reminder) {
+  const { rows } = await query(
+    'SELECT * FROM business_email_connections WHERE business_id = $1', [reminder.business_id]
+  );
+  if (!rows.length) return null;
+  const conn = rows[0];
+
+  const { google } = require('googleapis');
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, process.env.GOOGLE_REDIRECT_URI
+  );
+  oauth2Client.setCredentials({
+    access_token:  decrypt(conn.access_token_enc),
+    refresh_token: decrypt(conn.refresh_token_enc),
+    expiry_date:   new Date(conn.token_expires_at).getTime(),
+  });
+
+  // Google access tokens expire hourly; the client refreshes them
+  // automatically using the refresh token, but the *new* access token
+  // (and occasionally a rotated refresh token) then needs saving back,
+  // or every send after the first would refresh again for nothing.
+  oauth2Client.on('tokens', (tokens) => {
+    query(`
+      UPDATE business_email_connections
+      SET access_token_enc = $1,
+          refresh_token_enc = COALESCE($2, refresh_token_enc),
+          token_expires_at = $3, updated_at = NOW()
+      WHERE business_id = $4
+    `, [
+      encrypt(tokens.access_token),
+      tokens.refresh_token ? encrypt(tokens.refresh_token) : null,
+      new Date(tokens.expiry_date || Date.now() + 3600_000),
+      reminder.business_id,
+    ]).catch(err => logger.error('Failed to persist refreshed Google token', { error: err.message, businessId: reminder.business_id }));
+  });
+
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+  const fromName = reminder.business_name || conn.connected_email;
+  const raw = buildRawEmail({
+    from:    `"${fromName}" <${conn.connected_email}>`,
+    to:      reminder.email,
+    subject: reminder.message_subject || `Service Reminder - ${reminder.reminder_type}`,
+    text:    reminder.message_body,
+    html:    buildEmailHtml(reminder),
+  });
+
+  try {
+    const result = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+    logger.info('Email sent via connected Gmail', { to: reminder.email, businessId: reminder.business_id, msgId: result.data.id });
+    return { success: true, provider: 'gmail_oauth', providerId: result.data.id, emailMsgId: result.data.id };
+  } catch (err) {
+    logger.error('Gmail send failed', { error: err.message, businessId: reminder.business_id });
+    return { success: false, error: err.message, provider: 'gmail_oauth' };
+  }
+}
+
+async function sendEmailViaSmtp(reminder) {
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
 
   if (!SMTP_HOST) {
     logger.warn('SMTP not configured — skipping (dev mode)');
@@ -189,6 +263,33 @@ async function sendEmail(reminder) {
 // ─────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────
+// Builds a MIME multipart/alternative message and base64url-encodes it,
+// as required by the Gmail API's messages.send `raw` field.
+function buildRawEmail({ from, to, subject, text, html }) {
+  const boundary = `shihfu_${Date.now()}`;
+  const message = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    text || '',
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    '',
+    html || '',
+    '',
+    `--${boundary}--`,
+  ].join('\r\n');
+
+  return Buffer.from(message).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 }

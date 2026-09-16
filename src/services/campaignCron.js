@@ -64,6 +64,7 @@ async function dispatchCampaign(campaign) {
 
     const result = await messagingService.send({
       id: campaign.id, channel,
+      business_id: campaign.business_id,
       phone: customer.phone, email: customer.email,
       customer_name: customer.name,
       business_name: business?.name, business_email: business?.email,
