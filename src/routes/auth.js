@@ -5,6 +5,7 @@ const jwt     = require('jsonwebtoken');
 const { query, withTransaction } = require('../../config/database');
 const { validate, schemas } = require('../middleware/validate');
 const { authenticate }      = require('../middleware/auth');
+const messagingService      = require('../services/messaging');
 const R      = require('../utils/response');
 const logger = require('../utils/logger');
 
@@ -60,10 +61,19 @@ router.post('/register', validate(schemas.register), async (req, res) => {
       refreshToken,
       business: result.business,
       staff: {
-        id:   result.staff.id,
-        name: result.staff.name,
-        email: result.staff.email,
-        role: result.staff.role,
+        id:           result.staff.id,
+        name:         result.staff.name,
+        email:        result.staff.email,
+        role:         result.staff.role,
+        // Same shape as /auth/login's staff object — without this the
+        // dashboard shows generic placeholders ("Your Business") right
+        // after signup until the next login repopulates it.
+        businessId:   result.business.id,
+        businessName: result.business.name,
+        vertical:     result.business.vertical,
+        plan:         result.business.plan,
+        planStatus:   result.business.plan_status,
+        language:     preferredLang,
       },
     }, 'Business registered successfully');
 
@@ -135,6 +145,85 @@ router.post('/refresh', async (req, res) => {
     return R.success(res, { accessToken, refreshToken: newRefresh });
   } catch {
     return R.error(res, 'Invalid or expired refresh token', 401);
+  }
+});
+
+// ─── POST /auth/forgot-password ───────────────────────────────────
+// Always responds with the same generic message regardless of
+// whether the email exists, to avoid leaking which emails have
+// accounts. A real OTP is only generated and emailed when it does.
+router.post('/forgot-password', validate(schemas.forgotPassword), async (req, res) => {
+  const { email } = req.body;
+  const genericMessage = 'If an account exists for that email, we have sent a password reset code to it.';
+
+  try {
+    const { rows } = await query(
+      `SELECT s.id, s.name, s.email FROM staff s WHERE s.email = $1 AND s.is_active = true LIMIT 1`,
+      [email]
+    );
+
+    if (rows.length) {
+      const staff = rows[0];
+      const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+      const otpHash = await bcrypt.hash(otp, 10);
+
+      await query(`
+        INSERT INTO password_reset_otps (staff_id, otp_hash, expires_at)
+        VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
+      `, [staff.id, otpHash]);
+
+      await messagingService.sendOtpEmail({ email: staff.email, otp, ownerName: staff.name });
+      logger.info('Password reset OTP generated', { staffId: staff.id });
+    }
+
+    return R.success(res, {}, genericMessage);
+  } catch (err) {
+    logger.error('Forgot password error', { error: err.message });
+    // Still return the generic message — don't leak whether the lookup itself failed
+    return R.success(res, {}, genericMessage);
+  }
+});
+
+// ─── POST /auth/reset-password ─────────────────────────────────────
+router.post('/reset-password', validate(schemas.resetPassword), async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+
+  try {
+    const { rows: staffRows } = await query(
+      `SELECT id FROM staff WHERE email = $1 AND is_active = true LIMIT 1`, [email]
+    );
+    if (!staffRows.length) return R.error(res, 'Invalid or expired code', 400);
+    const staffId = staffRows[0].id;
+
+    const { rows: otpRows } = await query(`
+      SELECT id, otp_hash, expires_at, attempt_count FROM password_reset_otps
+      WHERE staff_id = $1 AND used_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `, [staffId]);
+
+    if (!otpRows.length) return R.error(res, 'Invalid or expired code', 400);
+    const record = otpRows[0];
+
+    if (record.attempt_count >= 5) return R.error(res, 'Too many attempts — request a new code', 429);
+    if (new Date(record.expires_at) < new Date()) return R.error(res, 'Invalid or expired code', 400);
+
+    const valid = await bcrypt.compare(otp, record.otp_hash);
+    if (!valid) {
+      await query(`UPDATE password_reset_otps SET attempt_count = attempt_count + 1 WHERE id = $1`, [record.id]);
+      return R.error(res, 'Invalid or expired code', 400);
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    await withTransaction(async (client) => {
+      await client.query(`UPDATE staff SET password_hash = $1 WHERE id = $2`, [passwordHash, staffId]);
+      await client.query(`UPDATE password_reset_otps SET used_at = NOW() WHERE id = $1`, [record.id]);
+    });
+
+    logger.info('Password reset completed', { staffId });
+    return R.success(res, {}, 'Password updated — you can now sign in with your new password');
+  } catch (err) {
+    logger.error('Reset password error', { error: err.message });
+    return R.error(res, 'Failed to reset password');
   }
 });
 

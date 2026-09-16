@@ -28,7 +28,13 @@ const indianPhone = Joi.string()
   .messages({ 'string.pattern.base': 'Must be a valid 10-digit Indian mobile number' });
 
 const channels = ['whatsapp', 'sms', 'email'];
-const verticals = ['veterinary', 'salon_beauty', 'auto_repair', 'home_services', 'retail', 'other'];
+// Must match the SIGNUP_VERTICALS keys in shihfu-web/lib/industry-config.js
+// exactly — a mismatch here means signup fails validation for that vertical.
+const verticals = [
+  'auto_repair', 'veterinary', 'salon_spa', 'home_cleaning', 'ac_maintenance',
+  'pest_control', 'healthcare_eye', 'healthcare_dental', 'fitness_wellness',
+  'real_estate', 'other',
+];
 const languages = ['en', 'hi', 'ta', 'te', 'kn', 'ml', 'mr', 'gu', 'bn', 'pa'];
 
 // ─── Schemas ──────────────────────────────────────────────────────
@@ -51,6 +57,16 @@ const schemas = {
   login: Joi.object({
     email:    Joi.string().email().required(),
     password: Joi.string().required(),
+  }),
+
+  forgotPassword: Joi.object({
+    email: Joi.string().email().required(),
+  }),
+
+  resetPassword: Joi.object({
+    email:       Joi.string().email().required(),
+    otp:         Joi.string().length(6).pattern(/^\d+$/).required(),
+    newPassword: Joi.string().min(8).max(72).required(),
   }),
 
   // Customers

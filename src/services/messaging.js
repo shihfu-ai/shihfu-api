@@ -225,6 +225,45 @@ async function sendEmailViaGmail(reminder) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Password reset OTP — always via the shared platform SMTP relay,
+// never a connected business Gmail account, since this happens
+// before/outside any business's own login context.
+// ─────────────────────────────────────────────────────────────────
+async function sendOtpEmail({ email, otp, ownerName }) {
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
+
+  if (!SMTP_HOST) {
+    // Dev convenience: log the code so the reset flow is testable
+    // without real SMTP configured. Never logged once SMTP is live.
+    logger.warn('SMTP not configured — OTP not emailed (dev mode)', { email, otp });
+    return { success: true, provider: 'email_mock' };
+  }
+
+  const nodemailer = require('nodemailer');
+  const transporter = nodemailer.createTransport({
+    host:   SMTP_HOST,
+    port:   parseInt(SMTP_PORT || '587'),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth:   { user: SMTP_USER, pass: SMTP_PASS },
+  });
+
+  try {
+    const info = await transporter.sendMail({
+      from:    `"${SMTP_FROM_NAME || 'Shih-Fu'}" <${SMTP_FROM_EMAIL}>`,
+      to:      email,
+      subject: 'Your Shih-Fu password reset code',
+      text:    `Hi ${ownerName || ''},\n\nYour password reset code is: ${otp}\n\nThis code expires in 10 minutes. If you didn't request this, you can ignore this email.`,
+      html:    `<div style="font-family:Georgia,serif;padding:24px;color:#333"><p>Hi ${escapeHtml(ownerName || '')},</p><p>Your password reset code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;color:#0d0d0d">${otp}</p><p style="color:#999;font-size:13px">This code expires in 10 minutes. If you didn't request this, you can ignore this email.</p></div>`,
+    });
+    logger.info('Password reset OTP emailed', { email, msgId: info.messageId });
+    return { success: true, provider: 'smtp', providerId: info.messageId };
+  } catch (err) {
+    logger.error('Failed to send OTP email', { error: err.message, email });
+    return { success: false, error: err.message };
+  }
+}
+
 async function sendEmailViaSmtp(reminder) {
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
 
@@ -350,4 +389,4 @@ function buildEmailHtml(reminder) {
 </html>`;
 }
 
-module.exports = { send };
+module.exports = { send, sendOtpEmail };
