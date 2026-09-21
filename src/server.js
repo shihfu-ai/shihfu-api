@@ -23,12 +23,16 @@ const reminderRoutes     = require('./routes/reminders');
 const analyticsRoutes    = require('./routes/analytics');
 const campaignRoutes     = require('./routes/campaigns');
 const emailAuthRoutes    = require('./routes/emailAuth');
+const { publicRouter: checkinPublicRoutes, businessRouter: businessRoutes } = require('./routes/checkin');
 
 const app     = express();
 const VERSION = process.env.API_VERSION || 'v1';
 const PORT    = parseInt(process.env.PORT || '4000');
 
 // ─── Security & Parsing ───────────────────────────────────────────
+// Behind Render's proxy: without this every visitor shares the proxy's
+// IP, so the rate limiters below would count everyone as one client.
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
@@ -84,6 +88,8 @@ app.use(`/api/${VERSION}/reminders`,      reminderRoutes);
 app.use(`/api/${VERSION}/analytics`,      analyticsRoutes);
 app.use(`/api/${VERSION}/campaigns`,      campaignRoutes);
 app.use(`/api/${VERSION}/email-auth`,     emailAuthRoutes);
+app.use(`/api/${VERSION}/public/checkin`, checkinPublicRoutes);
+app.use(`/api/${VERSION}/business`,       businessRoutes);
 
 // ─── Health Check ─────────────────────────────────────────────────
 app.get('/health', async (req, res) => {

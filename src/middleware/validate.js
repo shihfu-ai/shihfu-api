@@ -152,6 +152,20 @@ const schemas = {
     messageSubject:Joi.string().max(200).allow('', null),
   }),
 
+  // Public quick check-in form (no login) — a customer filling in
+  // their own details. Kept strict since anyone with the link can post.
+  publicCheckin: Joi.object({
+    name:     Joi.string().trim().min(2).max(120).required(),
+    phone:    indianPhone.required(),
+    email:    Joi.string().email().allow('', null),
+    city:     Joi.string().max(60).allow('', null),
+    channels: Joi.array().items(Joi.string().valid(...channels)).max(3).default([]),
+    entity: Joi.object({
+      name:      Joi.string().max(100).allow('', null),
+      assetData: Joi.object().pattern(Joi.string().max(40), Joi.string().max(200).allow('')).max(30),
+    }),
+  }),
+
   // Campaigns — bulk messages to the whole customer base (festival /
   // promo blasts), sent immediately or scheduled for a future date.
   createCampaign: Joi.object({
