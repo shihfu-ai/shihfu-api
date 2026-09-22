@@ -7,6 +7,10 @@ const R      = require('../utils/response');
 const logger = require('../utils/logger');
 
 const router = express.Router();
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const uuidParam = (req, res, next, val) => UUID_RE.test(val) ? next() : R.notFound(res, 'Not found');
+router.param('id', uuidParam);
+router.param('customerId', uuidParam);
 // All routes require authentication
 router.use(authenticate);
 
@@ -74,7 +78,10 @@ router.get('/', validate(schemas.listQuery, 'query'), async (req, res) => {
       conditions.push(`(c.name ILIKE $${p} OR c.phone ILIKE $${p} OR c.email ILIKE $${p})`);
       params.push(`%${search}%`); p++;
     }
+    // "Removed" customers (status opted_out) stay in the database for the
+    // service history but should not clutter the list unless asked for.
     if (status) { conditions.push(`c.status = $${p}`); params.push(status); p++; }
+    else        { conditions.push(`c.status <> 'opted_out'`); }
     if (channel){ conditions.push(`c.preferred_channel = $${p}`); params.push(channel); p++; }
     if (from)   { conditions.push(`c.created_at >= $${p}`); params.push(from); p++; }
     if (to)     { conditions.push(`c.created_at <= $${p}`); params.push(to); p++; }
@@ -139,6 +146,27 @@ router.post('/', validate(schemas.createCustomer), async (req, res) => {
     );
     if (parseInt(cnt.count) >= biz.max_customers) {
       return R.error(res, `Customer limit reached (${biz.max_customers}). Please upgrade your plan.`, 403);
+    }
+
+    const { rows: [removed] } = await query(
+      `SELECT id FROM customers WHERE business_id = $1 AND phone = $2 AND status = 'opted_out'`,
+      [businessId, customerData.phone]
+    );
+    if (removed) {
+      // Keep the id (and so their service history), refresh their details,
+      // and treat the re-add as fresh consent choices from the business.
+      const { rows: [revived] } = await query(`
+        UPDATE customers SET
+          name = $1, email = $2, city = $3, address = $4, status = 'active',
+          preferred_channel = $5, opted_in_sms = $6, opted_in_whatsapp = $7, opted_in_email = $8,
+          opted_in_at = CASE WHEN ($6 OR $7 OR $8) THEN NOW() ELSE NULL END, opted_out_at = NULL
+        WHERE id = $9 RETURNING *
+      `, [
+        customerData.name, customerData.email || null, customerData.city || null, customerData.address || null,
+        customerData.preferredChannel, customerData.optedInSms, customerData.optedInWhatsapp, customerData.optedInEmail,
+        removed.id,
+      ]);
+      return R.created(res, { customer: revived, entity: null }, 'Customer added successfully');
     }
 
     const result = await withTransaction(async (client) => {
@@ -273,6 +301,14 @@ router.patch('/:id', validate(schemas.updateCustomer), async (req, res) => {
         customer = rows[0];
       }
       if (!customer) return null;
+
+      if (updates.status === 'opted_out') {
+        await client.query(
+          `UPDATE reminders SET status = 'skipped', failure_reason = 'Customer removed'
+           WHERE customer_id = $1 AND status = 'scheduled'`, [id]
+        );
+        await client.query('UPDATE customers SET opted_out_at = NOW() WHERE id = $1', [id]);
+      }
 
       if (hasEntityData) {
         const { rows: [existingEntity] } = await client.query(`

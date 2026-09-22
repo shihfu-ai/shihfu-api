@@ -8,6 +8,10 @@ const R      = require('../utils/response');
 const logger = require('../utils/logger');
 
 const router = express.Router();
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const uuidParam = (req, res, next, val) => UUID_RE.test(val) ? next() : R.notFound(res, 'Not found');
+router.param('id', uuidParam);
+router.param('customerId', uuidParam);
 router.use(authenticate);
 
 // ─── GET /reminders ───────────────────────────────────────────────
@@ -95,6 +99,14 @@ router.post('/', validate(schemas.createReminder), async (req, res) => {
       [data.customerId, businessId]
     );
     if (!customer) return R.notFound(res, 'Customer not found');
+
+    if (data.entityId) {
+      const { rows: [ent] } = await query(
+        'SELECT id FROM customer_entities WHERE id = $1 AND customer_id = $2',
+        [data.entityId, data.customerId]
+      );
+      if (!ent) return R.notFound(res, 'Pet or vehicle not found for this customer');
+    }
 
     const { rows: [reminder] } = await query(`
       INSERT INTO reminders

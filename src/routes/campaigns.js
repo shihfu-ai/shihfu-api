@@ -7,6 +7,7 @@ const { query, withTransaction } = require('../../config/database');
 const { authenticate, authorize } = require('../middleware/auth');
 const { validate, schemas }       = require('../middleware/validate');
 const { dispatchCampaign }        = require('../services/campaignCron');
+const { getChannelStatus }        = require('../services/messaging');
 const R      = require('../utils/response');
 const logger = require('../utils/logger');
 
@@ -38,6 +39,12 @@ router.post('/', validate(schemas.createCampaign), async (req, res) => {
   const data       = req.body;
 
   try {
+    const status = await getChannelStatus(businessId);
+    const blocked = data.channels.filter(ch => !status[ch]?.available);
+    if (blocked.length) {
+      return R.badRequest(res, blocked.map(ch => status[ch].reason).join('. '));
+    }
+
     const { rows: [campaign] } = await query(`
       INSERT INTO campaigns (business_id, created_by, label, message_body, channels, scheduled_at, status)
       VALUES ($1,$2,$3,$4,$5,$6,'scheduled')

@@ -2,6 +2,7 @@
 const express = require('express');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
+const crypto  = require('crypto');
 const { query, withTransaction } = require('../../config/database');
 const { validate, schemas } = require('../middleware/validate');
 const { authenticate }      = require('../middleware/auth');
@@ -158,13 +159,15 @@ router.post('/forgot-password', validate(schemas.forgotPassword), async (req, re
 
   try {
     const { rows } = await query(
-      `SELECT s.id, s.name, s.email FROM staff s WHERE s.email = $1 AND s.is_active = true LIMIT 1`,
+      `SELECT s.id, s.name, s.email, s.business_id, b.name AS business_name
+       FROM staff s JOIN businesses b ON b.id = s.business_id
+       WHERE s.email = $1 AND s.is_active = true LIMIT 1`,
       [email]
     );
 
     if (rows.length) {
       const staff = rows[0];
-      const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+      const otp = String(crypto.randomInt(100000, 1000000)); // 6 digits, cryptographically random
       const otpHash = await bcrypt.hash(otp, 10);
 
       await query(`
@@ -172,7 +175,10 @@ router.post('/forgot-password', validate(schemas.forgotPassword), async (req, re
         VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
       `, [staff.id, otpHash]);
 
-      await messagingService.sendOtpEmail({ email: staff.email, otp, ownerName: staff.name });
+      await messagingService.sendOtpEmail({
+        email: staff.email, otp, ownerName: staff.name,
+        businessId: staff.business_id, businessName: staff.business_name,
+      });
       logger.info('Password reset OTP generated', { staffId: staff.id });
     }
 
@@ -227,13 +233,48 @@ router.post('/reset-password', validate(schemas.resetPassword), async (req, res)
   }
 });
 
+// ─── PATCH /auth/me ───────────────────────────────────────────────
+// Update your own name and (for the business) contact phone.
+router.patch('/me', authenticate, validate(schemas.updateMe), async (req, res) => {
+  const { name, phone } = req.body;
+  try {
+    await withTransaction(async (client) => {
+      if (name)  await client.query('UPDATE staff SET name = $1 WHERE id = $2', [name, req.user.staffId]);
+      if (phone) await client.query('UPDATE businesses SET phone = $1 WHERE id = $2', [phone, req.user.businessId]);
+    });
+    return R.success(res, { name, phone }, 'Profile updated');
+  } catch (err) {
+    logger.error('Update profile error', { error: err.message });
+    return R.error(res);
+  }
+});
+
+// ─── POST /auth/change-password ────────────────────────────────────
+router.post('/change-password', authenticate, validate(schemas.changePassword), async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  try {
+    const { rows } = await query('SELECT password_hash FROM staff WHERE id = $1', [req.user.staffId]);
+    if (!rows.length || !(await bcrypt.compare(currentPassword, rows[0].password_hash))) {
+      return R.error(res, 'Current password is incorrect', 400);
+    }
+    if (currentPassword === newPassword) {
+      return R.error(res, 'New password must be different from your current password', 400);
+    }
+    await query('UPDATE staff SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(newPassword, 12), req.user.staffId]);
+    return R.success(res, {}, 'Password updated');
+  } catch (err) {
+    logger.error('Change password error', { error: err.message });
+    return R.error(res);
+  }
+});
+
 // ─── GET /auth/me ─────────────────────────────────────────────────
 router.get('/me', authenticate, async (req, res) => {
   try {
     const { rows } = await query(`
       SELECT s.id, s.name, s.email, s.role, s.last_login_at,
              b.id AS business_id, b.name AS business_name, b.vertical,
-             b.plan, b.plan_status, b.trial_ends_at, b.city, b.preferred_language
+             b.plan, b.plan_status, b.trial_ends_at, b.city, b.preferred_language, b.phone AS business_phone
       FROM staff s JOIN businesses b ON b.id = s.business_id
       WHERE s.id = $1
     `, [req.user.staffId]);

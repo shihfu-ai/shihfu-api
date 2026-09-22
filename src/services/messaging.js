@@ -8,6 +8,23 @@
 //   Email— SMTP (SendGrid / Zoho Mail)
 
 const logger = require('../utils/logger');
+
+// A provider counts as configured only if its env var is set to a real
+// value - the .env.example placeholders (your_..., ACxxxx...) don't count.
+const isConfigured = (v) => !!v && !/^your_|^ACx+$/i.test(v);
+
+// Outside production, an unconfigured provider is mocked as "sent" so the
+// app can be developed without live accounts. In production that would be
+// a lie: reminders would be marked sent and nothing delivered. So there
+// it fails loudly instead.
+const notConfigured = (provider, label) => {
+  if (process.env.NODE_ENV === 'production') {
+    logger.warn(`${label} is not configured; message not sent`);
+    return { success: false, provider, error: `${label} messaging is not set up yet, so this message was not sent.` };
+  }
+  logger.warn(`${label} not configured (dev mode, mocked as sent)`);
+  return { success: true, provider: provider + '_mock', providerId: `mock_${provider}_${Date.now()}` };
+};
 const { query } = require('../../config/database');
 const { encrypt, decrypt } = require('../utils/crypto');
 
@@ -50,9 +67,8 @@ async function send(reminder) {
 async function sendWhatsApp(reminder) {
   const { WHATSAPP_API_URL, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN, WHATSAPP_TEMPLATE_LANG } = process.env;
 
-  if (!WHATSAPP_ACCESS_TOKEN) {
-    logger.warn('WhatsApp not configured — skipping (dev mode)');
-    return { success: true, provider: 'whatsapp_mock', providerId: `mock_wa_${Date.now()}`, whatsappMsgId: null };
+  if (!isConfigured(WHATSAPP_ACCESS_TOKEN) || !isConfigured(WHATSAPP_PHONE_NUMBER_ID)) {
+    return notConfigured('whatsapp', 'WhatsApp');
   }
 
   // Format phone to E.164: 10-digit Indian → +91XXXXXXXXXX
@@ -121,9 +137,8 @@ async function sendWhatsApp(reminder) {
 async function sendSMS(reminder) {
   const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, TWILIO_DLT_TEMPLATE_ID } = process.env;
 
-  if (!TWILIO_ACCOUNT_SID) {
-    logger.warn('Twilio not configured — skipping (dev mode)');
-    return { success: true, provider: 'sms_mock', providerId: `mock_sms_${Date.now()}`, twilioSid: null };
+  if (!isConfigured(TWILIO_ACCOUNT_SID) || !isConfigured(TWILIO_AUTH_TOKEN)) {
+    return notConfigured('sms', 'SMS');
   }
 
   const twilio = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -147,28 +162,29 @@ async function sendSMS(reminder) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Email — the business's own connected Gmail account when they've
-// connected one (private to them, Shih-Fu never reads their inbox),
-// otherwise a shared SMTP relay branded with their name (see
-// sendEmailViaSmtp below).
+// Email — always sent from the business's OWN connected Gmail account,
+// never from a Shih-Fu address. There is deliberately no shared relay
+// fallback: a business that hasn't connected Gmail can't send email,
+// and gets a clear error telling them to (see NOT_CONNECTED_MSG).
 // ─────────────────────────────────────────────────────────────────
+const NOT_CONNECTED_MSG = 'Email not sent: connect your Gmail account in Account Settings > Email first.';
+
 async function sendEmail(reminder) {
   if (!reminder.email) {
     return { success: false, error: 'No email address on file for this customer', provider: 'email' };
   }
-
-  if (reminder.business_id) {
-    const viaGmail = await sendEmailViaGmail(reminder);
-    if (viaGmail) return viaGmail;
+  if (!reminder.business_id) {
+    return { success: false, error: NOT_CONNECTED_MSG, provider: 'email' };
   }
 
-  return sendEmailViaSmtp(reminder);
+  const viaGmail = await sendEmailViaGmail(reminder);
+  return viaGmail || { success: false, error: NOT_CONNECTED_MSG, provider: 'email' };
 }
 
 // Sends through the business's own Gmail account via the Gmail API,
 // using the OAuth tokens stored (encrypted) when they connected it in
 // Account Settings. Returns null (not a result) when no connection
-// exists, so the caller falls back to the shared SMTP relay.
+// exists.
 async function sendEmailViaGmail(reminder) {
   const { rows } = await query(
     'SELECT * FROM business_email_connections WHERE business_id = $1', [reminder.business_id]
@@ -212,7 +228,7 @@ async function sendEmailViaGmail(reminder) {
     to:      reminder.email,
     subject: reminder.message_subject || `Service Reminder - ${reminder.reminder_type}`,
     text:    reminder.message_body,
-    html:    buildEmailHtml(reminder),
+    html:    reminder.otp_html || buildEmailHtml(reminder),
   });
 
   try {
@@ -226,18 +242,34 @@ async function sendEmailViaGmail(reminder) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Password reset OTP — always via the shared platform SMTP relay,
-// never a connected business Gmail account, since this happens
-// before/outside any business's own login context.
+// Password reset OTP. Sent from the business's own connected Gmail
+// (to their own login address) when they have one, so it doesn't need a
+// Shih-Fu sender either. Only if they haven't connected Gmail does it
+// fall back to a platform SMTP account, and only if the operator has
+// configured one. Otherwise the code cannot be delivered and is NOT
+// written to the logs (a code in a log is a password-reset backdoor).
 // ─────────────────────────────────────────────────────────────────
-async function sendOtpEmail({ email, otp, ownerName }) {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
+async function sendOtpEmail({ email, otp, ownerName, businessId, businessName }) {
+  const text = `Hi ${ownerName || ''},\n\nYour password reset code is: ${otp}\n\nThis code expires in 10 minutes. If you didn't request this, you can ignore this email.`;
+  const html = `<div style="font-family:Georgia,serif;padding:24px;color:#333"><p>Hi ${escapeHtml(ownerName || '')},</p><p>Your password reset code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;color:#0d0d0d">${otp}</p><p style="color:#999;font-size:13px">This code expires in 10 minutes. If you didn't request this, you can ignore this email.</p></div>`;
 
-  if (!SMTP_HOST) {
-    // Dev convenience: log the code so the reset flow is testable
-    // without real SMTP configured. Never logged once SMTP is live.
-    logger.warn('SMTP not configured — OTP not emailed (dev mode)', { email, otp });
-    return { success: true, provider: 'email_mock' };
+  if (businessId) {
+    const viaGmail = await sendEmailViaGmail({
+      business_id: businessId, business_name: businessName, email,
+      message_subject: 'Your password reset code', message_body: text, otp_html: html,
+    });
+    if (viaGmail) return viaGmail;
+  }
+
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
+  if (!isConfigured(SMTP_HOST) || !isConfigured(SMTP_PASS)) {
+    if (process.env.NODE_ENV !== 'production') {
+      // Dev convenience only: lets the reset flow be tested locally.
+      logger.warn('No email sender available - OTP not emailed (dev mode)', { email, otp });
+      return { success: true, provider: 'email_mock' };
+    }
+    logger.warn('Password reset requested but no email sender is available (Gmail not connected, no platform SMTP)', { email });
+    return { success: false, error: 'No email sender available' };
   }
 
   const nodemailer = require('nodemailer');
@@ -252,51 +284,15 @@ async function sendOtpEmail({ email, otp, ownerName }) {
     const info = await transporter.sendMail({
       from:    `"${SMTP_FROM_NAME || 'Shih-Fu'}" <${SMTP_FROM_EMAIL}>`,
       to:      email,
-      subject: 'Your Shih-Fu password reset code',
-      text:    `Hi ${ownerName || ''},\n\nYour password reset code is: ${otp}\n\nThis code expires in 10 minutes. If you didn't request this, you can ignore this email.`,
-      html:    `<div style="font-family:Georgia,serif;padding:24px;color:#333"><p>Hi ${escapeHtml(ownerName || '')},</p><p>Your password reset code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;color:#0d0d0d">${otp}</p><p style="color:#999;font-size:13px">This code expires in 10 minutes. If you didn't request this, you can ignore this email.</p></div>`,
+      subject: 'Your password reset code',
+      text, html,
     });
-    logger.info('Password reset OTP emailed', { email, msgId: info.messageId });
+    logger.info('Password reset OTP emailed', { msgId: info.messageId });
     return { success: true, provider: 'smtp', providerId: info.messageId };
   } catch (err) {
-    logger.error('Failed to send OTP email', { error: err.message, email });
+    logger.error('Failed to send OTP email', { error: err.message });
     return { success: false, error: err.message };
   }
-}
-
-async function sendEmailViaSmtp(reminder) {
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME, SMTP_FROM_EMAIL } = process.env;
-
-  if (!SMTP_HOST) {
-    logger.warn('SMTP not configured — skipping (dev mode)');
-    return { success: true, provider: 'email_mock', providerId: `mock_email_${Date.now()}`, emailMsgId: null };
-  }
-
-  const nodemailer = require('nodemailer');
-  const transporter = nodemailer.createTransport({
-    host:   SMTP_HOST,
-    port:   parseInt(SMTP_PORT || '587'),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth:   { user: SMTP_USER, pass: SMTP_PASS },
-  });
-
-  // Sent through one authenticated Shih-Fu sending domain (so SPF/DKIM
-  // pass and mail doesn't land in spam), but the visible From name is
-  // the business's own name and Reply-To is their real signup email —
-  // so customers see and can respond to the business, not "Shih-Fu".
-  const fromName = reminder.business_name || SMTP_FROM_NAME || 'Shih-Fu Notifications';
-
-  const info = await transporter.sendMail({
-    from:    `"${fromName}" <${SMTP_FROM_EMAIL}>`,
-    replyTo: reminder.business_email || undefined,
-    to:      reminder.email,
-    subject: reminder.message_subject || `Service Reminder - ${reminder.reminder_type}`,
-    text:    reminder.message_body,
-    html:    buildEmailHtml(reminder),
-  });
-
-  logger.info('Email sent', { to: reminder.email, msgId: info.messageId, reminderId: reminder.id });
-  return { success: true, provider: 'smtp', providerId: info.messageId, emailMsgId: info.messageId };
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -362,24 +358,15 @@ function buildEmailHtml(reminder) {
         <tr>
           <td style="padding:32px">
             <p style="font-size:1rem;color:#333;line-height:1.7;margin-bottom:24px">
-              ${(reminder.message_body || '').replace(/\n/g, '<br>')}
+              ${escapeHtml(reminder.message_body || '').replace(/\n/g, '<br>')}
             </p>
-            <table>
-              <tr>
-                <td style="background:#0d0d0d;border-radius:4px;padding:10px 24px">
-                  <a href="#" style="color:#c8a84b;font-family:Georgia,serif;font-size:.9rem;text-decoration:none;font-weight:700">
-                    Book Appointment
-                  </a>
-                </td>
-              </tr>
-            </table>
           </td>
         </tr>
         <!-- Footer -->
         <tr>
           <td style="padding:16px 32px;border-top:1px solid #f0f0f0;font-size:.75rem;color:#999">
-            You are receiving this because you opted in to service reminders.
-            <a href="#" style="color:#999">Unsubscribe</a>
+            You are receiving this because you agreed to hear from ${escapeHtml(reminder.business_name || 'this business')}.
+            To stop receiving these emails, just reply and let them know.
           </td>
         </tr>
       </table>
@@ -389,4 +376,21 @@ function buildEmailHtml(reminder) {
 </html>`;
 }
 
-module.exports = { send, sendOtpEmail };
+// What this business can actually send right now, so the UI can say so
+// up front instead of letting people queue messages that will fail.
+async function getChannelStatus(businessId) {
+  const { rows } = await query(
+    'SELECT connected_email FROM business_email_connections WHERE business_id = $1', [businessId]
+  );
+  const live = process.env.NODE_ENV !== 'production'; // dev mocks unconfigured providers
+  return {
+    email:    { available: rows.length > 0, connectedEmail: rows[0]?.connected_email || null,
+                reason: rows.length ? null : 'Connect your Gmail in Account Settings > Email' },
+    whatsapp: { available: live || (isConfigured(process.env.WHATSAPP_ACCESS_TOKEN) && isConfigured(process.env.WHATSAPP_PHONE_NUMBER_ID)),
+                reason: 'WhatsApp messaging is not set up yet' },
+    sms:      { available: live || (isConfigured(process.env.TWILIO_ACCOUNT_SID) && isConfigured(process.env.TWILIO_AUTH_TOKEN)),
+                reason: 'SMS messaging is not set up yet' },
+  };
+}
+
+module.exports = { send, sendOtpEmail, getChannelStatus };

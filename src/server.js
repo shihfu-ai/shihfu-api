@@ -72,13 +72,22 @@ const limiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,  // 15 min window
-  max: 10,                    // 10 login attempts per window
+  max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '10'),  // login/register attempts per window
   message: { success: false, message: 'Too many login attempts. Please wait 15 minutes.' },
 });
 
 app.use(`/api/${VERSION}`, limiter);
 app.use(`/api/${VERSION}/auth/login`,    authLimiter);
 app.use(`/api/${VERSION}/auth/register`, authLimiter);
+
+// A 6-digit reset code is only safe if guesses and code requests are limited
+const resetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: parseInt(process.env.RESET_RATE_LIMIT_MAX || '8'),
+  message: { success: false, message: 'Too many attempts. Please wait 15 minutes and try again.' },
+});
+app.use(`/api/${VERSION}/auth/forgot-password`, resetLimiter);
+app.use(`/api/${VERSION}/auth/reset-password`,  resetLimiter);
 
 // ─── Routes ───────────────────────────────────────────────────────
 app.use(`/api/${VERSION}/auth`,           authRoutes);
@@ -125,6 +134,9 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
 
   if (err.type === 'entity.too.large') {
     return R.badRequest(res, 'Request payload too large');
+  }
+  if (err.type === 'entity.parse.failed') {
+    return R.badRequest(res, 'Request body is not valid JSON');
   }
 
   R.error(res, process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message);

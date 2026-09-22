@@ -108,6 +108,16 @@ publicRouter.post('/:token', submitLimiter, validate(schemas.publicCheckin), asy
   }
 });
 
+// ─── GET /business/channel-status ──────────────────────────────────
+businessRouter.get('/channel-status', authenticate, async (req, res) => {
+  try {
+    return R.success(res, await require('../services/messaging').getChannelStatus(req.user.businessId));
+  } catch (err) {
+    logger.error('Channel status error', { error: err.message });
+    return R.error(res);
+  }
+});
+
 // ─── GET /business/checkin-link ────────────────────────────────────
 businessRouter.get('/checkin-link', authenticate, async (req, res) => {
   try {

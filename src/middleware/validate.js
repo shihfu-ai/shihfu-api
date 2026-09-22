@@ -59,6 +59,16 @@ const schemas = {
     password: Joi.string().required(),
   }),
 
+  updateMe: Joi.object({
+    name:  Joi.string().trim().min(2).max(100),
+    phone: indianPhone,
+  }).min(1),
+
+  changePassword: Joi.object({
+    currentPassword: Joi.string().required(),
+    newPassword:     Joi.string().min(8).max(72).required(),
+  }),
+
   forgotPassword: Joi.object({
     email: Joi.string().email().required(),
   }),
