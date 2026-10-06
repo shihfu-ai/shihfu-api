@@ -65,6 +65,7 @@ async function dispatchCampaign(campaign) {
     const result = await messagingService.send({
       id: campaign.id, channel,
       business_id: campaign.business_id,
+      campaign_id: campaign.id, customer_id: customer.id,
       phone: customer.phone, email: customer.email,
       customer_name: customer.name,
       business_name: business?.name, business_email: business?.email,
@@ -82,7 +83,7 @@ async function dispatchCampaign(campaign) {
       `, [
         campaign.business_id, customer.id, campaign.id, channel,
         channel === 'email' ? customer.email : customer.phone,
-        campaign.message_body, result.provider, result.providerId,
+        result.sentBody || campaign.message_body, result.provider, result.providerId,
         result.success ? 'sent' : 'failed',
       ]);
     });

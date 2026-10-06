@@ -106,7 +106,7 @@ async function processduedReminders() {
             reminder.business_id, reminder.customer_id, reminder.id,
             reminder.channel,
             reminder.channel === 'email' ? reminder.email : reminder.phone,
-            messageBody, result.provider, result.providerId,
+            result.sentBody || messageBody, result.provider, result.providerId,
           ]);
         });
 

@@ -27,6 +27,7 @@ const notConfigured = (provider, label) => {
 };
 const { query } = require('../../config/database');
 const { encrypt, decrypt } = require('../utils/crypto');
+const booking = require('./booking');
 
 // ─────────────────────────────────────────────────────────────────
 // Main dispatch function
@@ -43,9 +44,28 @@ const { encrypt, decrypt } = require('../utils/crypto');
 // are approved and reviewed separately by Meta, so callers must say
 // which kind of message this is.
 // ─────────────────────────────────────────────────────────────────
-async function send(reminder) {
-  const { channel } = reminder;
+async function send(original) {
+  // Every message to a known customer carries a unique booking link, so a
+  // booking can be traced back to the message, channel and time that
+  // produced it. Needs original.customer_id (and campaign_id for blasts).
+  let link = null;
+  try { link = await booking.createLinkFor(original); }
+  catch (err) { logger.warn('Booking link not created; sending without one', { error: err.message }); }
 
+  const reminder = link ? { ...original, booking_url: link.url } : original;
+  const result = await dispatch(reminder);
+
+  // A link only counts as "sent" once the message really went out.
+  if (link) await (result.success ? booking.markSent(link.id) : booking.discard(link.id));
+
+  // sentBody is what the customer actually received, so the audit log can
+  // record it verbatim (including the link).
+  const sentBody = link ? `${original.message_body || ''}\n\n${booking.bookingLine(link.url)}` : original.message_body;
+  return { ...result, sentBody, bookingLinkId: link ? link.id : null };
+}
+
+async function dispatch(reminder) {
+  const { channel } = reminder;
   try {
     switch (channel) {
       case 'whatsapp': return await sendWhatsApp(reminder);
@@ -59,6 +79,20 @@ async function send(reminder) {
     logger.error('Messaging dispatch error', { error: err.message, channel, reminderId: reminder.id });
     return { success: false, error: err.message, provider: channel };
   }
+}
+
+// The message text plus the booking link line, trimmed to a channel's
+// length limit by shortening the text (never the link). WhatsApp template
+// parameters may not contain newlines or long runs of spaces, so
+// `flatten` joins lines with a space.
+function bodyWithLink(reminder, max, flatten = false) {
+  let text = reminder.message_body || '';
+  if (flatten) text = text.replace(/\s*\n+\s*/g, ' ').replace(/ {4,}/g, '   ');
+  if (!reminder.booking_url) return text.slice(0, max);
+  const line = booking.bookingLine(reminder.booking_url);
+  const sep = flatten ? ' ' : '\n\n';
+  const room = Math.max(0, max - line.length - sep.length);
+  return `${text.slice(0, room)}${sep}${line}`;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -92,7 +126,7 @@ async function sendWhatsApp(reminder) {
       template: {
         name: templateName,
         language: { code: WHATSAPP_TEMPLATE_LANG || 'en' },
-        components: [{ type: 'body', parameters: [{ type: 'text', text: (reminder.message_body || '').slice(0, 1024) }] }],
+        components: [{ type: 'body', parameters: [{ type: 'text', text: bodyWithLink(reminder, 1024, true) }] }],
       },
     };
   } else {
@@ -102,7 +136,7 @@ async function sendWhatsApp(reminder) {
       recipient_type:    'individual',
       to:                toPhone,
       type:              'text',
-      text:              { body: reminder.message_body },
+      text:              { body: bodyWithLink(reminder, 4096) },
     };
   }
 
@@ -145,7 +179,7 @@ async function sendSMS(reminder) {
   const toPhone = formatIndianPhone(reminder.phone);
 
   // TRAI DLT: max 160 chars for a single SMS unit in India
-  const messageBody = reminder.message_body?.slice(0, 1530) || 'You have a service reminder.';
+  const messageBody = bodyWithLink({ ...reminder, message_body: reminder.message_body || 'You have a service reminder.' }, 1530);
 
   const message = await twilio.messages.create({
     body:           messageBody,
@@ -227,7 +261,7 @@ async function sendEmailViaGmail(reminder) {
     from:    `"${fromName}" <${conn.connected_email}>`,
     to:      reminder.email,
     subject: reminder.message_subject || `Service Reminder - ${reminder.reminder_type}`,
-    text:    reminder.message_body,
+    text:    bodyWithLink(reminder, 100000),
     html:    reminder.otp_html || buildEmailHtml(reminder),
   });
 
@@ -360,6 +394,11 @@ function buildEmailHtml(reminder) {
             <p style="font-size:1rem;color:#333;line-height:1.7;margin-bottom:24px">
               ${escapeHtml(reminder.message_body || '').replace(/\n/g, '<br>')}
             </p>
+            ${reminder.booking_url ? `
+            <p style="margin:0 0 12px">
+              <a href="${escapeHtml(reminder.booking_url)}" style="display:inline-block;background:#c8a84b;color:#0d0d0d;text-decoration:none;font-weight:700;padding:13px 26px;border-radius:4px;font-family:Arial,sans-serif;font-size:.95rem">Book your appointment</a>
+            </p>
+            <p style="font-size:.78rem;color:#888;margin:0;font-family:Arial,sans-serif">Or copy this link: <a href="${escapeHtml(reminder.booking_url)}" style="color:#888">${escapeHtml(reminder.booking_url)}</a></p>` : ''}
           </td>
         </tr>
         <!-- Footer -->

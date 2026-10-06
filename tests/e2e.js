@@ -443,6 +443,186 @@ async function main() {
   }
 
   // ───────────────────────────────────────────────────────────────
+  section('Booking links and appointments');
+  {
+    const pubGet  = (t) => fetch(`${API}/public/book/${t}`).then(async x => ({ status: x.status, body: await x.json() }));
+    const pubPost = (t, body, sub = '') => fetch(`${API}/public/book/${t}${sub}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(async x => ({ status: x.status, body: await x.json() }));
+    const bizId = A.staff.businessId;
+
+    // A customer, a reminder, a send: returns the booking token that went out with it
+    async function sendTo(name, { channel = 'sms', tok = A.token } = {}) {
+      const c = await call('POST', '/customers', { token: tok, body: { name, phone: phone(), email: `bk-${RUN}-${phoneSeq}@example.com`, preferredChannel: channel, optedInSms: true, optedInEmail: true, optedInWhatsapp: true } });
+      const id = c.data.customer.id;
+      const rem = await call('POST', '/reminders', { token: tok, body: { customerId: id, reminderType: 'Checkup Due', channel, scheduledAt: new Date(Date.now() + 86400000).toISOString(), messageBody: `Hi ${name}, time for your checkup.` } });
+      const sent = await call('POST', `/reminders/${rem.data.id}/send`, { token: tok });
+      const link = await pool.query('SELECT * FROM booking_links WHERE customer_id = $1', [id]);
+      return { id, reminderId: rem.data.id, sent, link: link.rows[0], links: link.rows };
+    }
+    const firstSlot = async (t, n = 0) => (await pubGet(t)).body.data.slots.flatMap(d => d.slots)[n];
+
+    // ── links ride along with every message
+    const k1 = await sendTo('Booker One');
+    check('SMS reminder sends (dev mock)', k1.sent.status === 200, [k1.sent.status, k1.sent.body?.message]);
+    check('a booking link row is created and stamped sent', k1.link && k1.link.sent_at && k1.link.channel === 'sms' && k1.link.reminder_id === k1.reminderId, k1.link);
+    check('link token is short and url-safe', /^[A-Za-z0-9_-]{12}$/.test(k1.link?.token || ''), k1.link?.token);
+    const ctx = k1.link?.context || {};
+    check('link stores send-time context for analytics', ctx.kind === 'reminder' && ctx.vertical === 'veterinary' && Number.isInteger(ctx.send_hour_ist) && ctx.reminder_type === 'Checkup Due' && 'days_since_last_visit' in ctx && ctx.prior_bookings === 0, ctx);
+    const logRow = await pool.query('SELECT message_body FROM message_log WHERE reminder_id = $1', [k1.reminderId]);
+    check('audit log records the message including the link', /Book your appointment: https?:\/\/\S+\/book\/[A-Za-z0-9_-]{12}$/.test(logRow.rows[0]?.message_body || ''), logRow.rows[0]);
+
+    const kFail = await sendTo('Email Fail', { channel: 'email' });
+    check('failed send (no Gmail) leaves no booking link behind', kFail.sent.status === 502 && kFail.links.length === 0, [kFail.sent.status, kFail.links.length]);
+
+    // ── public page
+    let r = await pubGet(k1.link.token);
+    check('public booking page loads without login', r.status === 200 && r.body.data.businessName === 'E2E A' && r.body.data.customerFirstName === 'Booker' && r.body.data.reminderType === 'Checkup Due', r);
+    check('page offers slots on open days only, none in the past', r.body.data.slots.length > 0 && r.body.data.slots.every(d => ![0].includes(new Date(d.date + 'T00:00:00Z').getUTCDay()) && d.slots.every(s => new Date(s.startAt) > new Date())), r.body.data.slots[0]);
+    await pubGet(k1.link.token);
+    let lk = (await pool.query('SELECT click_count, first_clicked_at, last_clicked_at FROM booking_links WHERE id = $1', [k1.link.id])).rows[0];
+    check('each page open is counted as a click', lk.click_count === 2 && lk.first_clicked_at && lk.last_clicked_at >= lk.first_clicked_at, lk);
+    r = await pubGet('nope-not-a-token');
+    check('unknown token -> 404', r.status === 404, r.status);
+    const unsent = await pool.query(`INSERT INTO booking_links (token, business_id, customer_id, channel) VALUES ('unsent_tok_1', $1, $2, 'sms') RETURNING token`, [bizId, k1.id]);
+    r = await pubGet(unsent.rows[0].token);
+    check('a link whose message never went out is not usable', r.status === 404, r.status);
+
+    // ── booking
+    const s1 = await firstSlot(k1.link.token, 0);
+    r = await pubPost(k1.link.token, { startAt: s1.startAt, notes: 'Bring the records' });
+    check('book a slot', r.status === 201 && r.body.data.startAt, r);
+    const ap = (await pool.query('SELECT * FROM appointments WHERE booking_link_id = $1', [k1.link.id])).rows;
+    check('appointment stored, attributed to the link', ap.length === 1 && ap[0].source === 'followup_link' && ap[0].status === 'booked' && ap[0].customer_id === k1.id && ap[0].service_type === 'Checkup Due' && ap[0].notes === 'Bring the records', ap);
+    lk = (await pool.query('SELECT booked_at FROM booking_links WHERE id = $1', [k1.link.id])).rows[0];
+    check('link marked booked', !!lk.booked_at);
+    r = await pubGet(k1.link.token);
+    check('page now shows the existing appointment', r.body.data.appointment && new Date(r.body.data.appointment.startAt).toISOString() === s1.startAt, r.body.data.appointment);
+    check('the booked slot is no longer offered (capacity 1)', !r.body.data.slots.flatMap(d => d.slots).some(s => s.startAt === s1.startAt));
+
+    const k2 = await sendTo('Booker Two');
+    r = await pubPost(k2.link.token, { startAt: s1.startAt });
+    check('a second customer cannot take the full slot', r.status === 409, r);
+    r = await pubPost(k2.link.token, { startAt: new Date(new Date(s1.startAt).getTime() + 7 * 60000).toISOString() });
+    check('off-grid time rejected', r.status === 409, r.status);
+    r = await pubPost(k2.link.token, { startAt: new Date(Date.now() - 86400000).toISOString() });
+    check('time in the past rejected', r.status === 409, r.status);
+    r = await pubPost(k2.link.token, { startAt: 'not-a-date' });
+    check('garbage date -> 400', r.status === 400, r.status);
+    r = await pubPost(k2.link.token, { startAt: s1.startAt, notes: 'x'.repeat(400) });
+    check('overlong notes -> 400', r.status === 400, r.status);
+
+    // moving an appointment frees the old slot and keeps just one active booking
+    const s2 = await firstSlot(k1.link.token, 1);
+    r = await pubPost(k1.link.token, { startAt: s2.startAt });
+    const act = (await pool.query(`SELECT start_at, status FROM appointments WHERE booking_link_id = $1 ORDER BY created_at`, [k1.link.id])).rows;
+    check('rebooking moves the appointment: old cancelled, one active', r.status === 201 && act.length === 2 && act[0].status === 'cancelled' && act[1].status === 'booked', act);
+    r = await pubPost(k2.link.token, { startAt: s1.startAt });
+    check('the vacated slot can be booked by someone else', r.status === 201, r);
+
+    // two simultaneous requests for the same last slot: exactly one wins
+    const k3 = await sendTo('Racer A'), k4 = await sendTo('Racer B');
+    const raceSlot = await firstSlot(k3.link.token, 5);
+    const race = await Promise.all([pubPost(k3.link.token, { startAt: raceSlot.startAt }), pubPost(k4.link.token, { startAt: raceSlot.startAt })]);
+    check('concurrent bookings cannot double-book a slot', race.map(x => x.status).sort().join() === '201,409', race.map(x => x.status));
+
+    // ── cancel
+    r = await pubPost(k1.link.token, {}, '/cancel');
+    check('customer can cancel from the link', r.status === 200, r);
+    r = await pubPost(k1.link.token, {}, '/cancel');
+    check('cancelling again -> 404', r.status === 404, r.status);
+    r = await pubPost(k1.link.token, { startAt: s2.startAt });
+    check('after cancelling they can book again', r.status === 201, r);
+
+    // ── removed customers and expiry
+    const k5 = await sendTo('Leaves Soon');
+    await call('PATCH', `/customers/${k5.id}`, { token: A.token, body: { status: 'opted_out' } });
+    check('a removed customer\'s link stops working', (await pubGet(k5.link.token)).status === 404);
+    const k6 = await sendTo('Old Link');
+    await pool.query(`UPDATE booking_links SET sent_at = NOW() - INTERVAL '100 days' WHERE id = $1`, [k6.link.id]);
+    r = await pubGet(k6.link.token);
+    check('a link older than 90 days is expired (410)', r.status === 410, r.status);
+
+    // ── business side
+    r = await call('GET', '/appointments?range=upcoming', { token: A.token });
+    check('business sees upcoming appointments with customer and channel', r.status === 200 && r.data.length >= 2 && r.data.every(x => x.customer_name && x.start_at) && r.data.some(x => x.booked_via_channel === 'sms'), r.data?.[0]);
+    check('upcoming list is soonest first', r.data.every((x, i, a) => i === 0 || new Date(a[i - 1].start_at) <= new Date(x.start_at)));
+    const apptId = r.data[0].id;
+    r = await call('GET', '/appointments/summary', { token: A.token });
+    check('appointment summary counts', r.status === 200 && r.data.upcoming >= 2 && r.data.from_followups_30d >= 3, r.data);
+    r = await call('GET', '/appointments?range=bogus', { token: A.token });
+    check('bad range rejected', r.status === 400, r.status);
+    r = await call('PATCH', `/appointments/${apptId}`, { token: B.token, body: { status: 'completed' } });
+    check('B cannot change A\'s appointment', r.status === 404, r.status);
+    r = await call('GET', '/appointments?range=all', { token: B.token });
+    check('B sees none of A\'s appointments', r.status === 200 && r.data.length === 0, r.data?.length);
+    r = await call('PATCH', `/appointments/${apptId}`, { token: A.token, body: { status: 'exploded' } });
+    check('invalid status rejected', r.status === 400, r.status);
+    r = await call('PATCH', `/appointments/${apptId}`, { token: A.token, body: { status: 'completed', notes: 'Done' } });
+    check('mark completed with a note', r.status === 200 && r.data.status === 'completed' && r.data.notes === 'Done', r.body);
+    r = await call('GET', '/appointments?range=past', { token: A.token });
+    check('completed moves to the past list', r.data.some(x => x.id === apptId));
+    r = await call('PATCH', '/appointments/not-a-uuid', { token: A.token, body: { status: 'completed' } });
+    check('malformed appointment id -> 404', r.status === 404, r.status);
+    const tomorrow = new Date(Date.now() + 2 * 86400000).toISOString();
+    r = await call('POST', '/appointments', { token: A.token, body: { customerId: cA.id, startAt: tomorrow, serviceType: 'Walk-in booking', durationMin: 45 } });
+    check('add an appointment by hand', r.status === 201 && r.data.source === 'manual', r.body);
+    r = await call('POST', '/appointments', { token: B.token, body: { customerId: cA.id, startAt: tomorrow } });
+    check('cannot add one for another business\'s customer', r.status === 404, r.status);
+    r = await call('POST', '/appointments', { token: A.token, body: { customerId: cA.id, entityId: bCustEntityPlaceholder(), startAt: tomorrow } });
+    check('foreign pet/vehicle on a manual appointment rejected', r.status === 404 || r.status === 400, r.status);
+
+    // ── settings: hours, capacity, switch off
+    r = await call('GET', '/business/booking-settings', { token: A.token });
+    check('settings default to a sensible week', r.status === 200 && r.data.settings.open === '10:00' && r.data.settings.enabled === true && r.data.settings.days.includes(1), r.data);
+    const bad = (label, body) => call('PUT', '/business/booking-settings', { token: A.token, body }).then(x => check(`settings reject ${label}`, x.status === 400, [x.status, x.body?.message]));
+    await bad('close before open', { open: '18:00', close: '09:00' });
+    await bad('weekday 7', { days: [7] });
+    await bad('no days', { days: [] });
+    await bad('odd slot length', { slotMinutes: 7 });
+    await bad('malformed time', { open: '25:99' });
+    await bad('empty body', {});
+    r = await call('PUT', '/business/booking-settings', { token: A.token, body: { open: '09:00', close: '11:00', slotMinutes: 60, capacity: 2, days: [0, 1, 2, 3, 4, 5, 6] } });
+    check('save hours (9 to 11, hourly, 2 at a time, every day)', r.status === 200 && r.data.settings.capacity === 2, r.body);
+    const k7 = await sendTo('Cap One'), k8 = await sendTo('Cap Two'), k9 = await sendTo('Cap Three');
+    const capDays = (await pubGet(k7.link.token)).body.data.slots;
+    check('slots follow the saved hours', capDays.every(d => d.slots.every(s => ['09:00', '10:00'].includes(s.label))), capDays[0]);
+    const cs = capDays[0].slots[0].startAt;
+    const cr = [];
+    for (const k of [k7, k8, k9]) cr.push((await pubPost(k.link.token, { startAt: cs })).status);
+    check('capacity 2 lets two book the same hour and blocks the third', cr.join() === '201,201,409', cr);
+    r = await call('PUT', '/business/booking-settings', { token: A.token, body: { enabled: false } });
+    check('switch booking off', r.status === 200 && r.data.settings.enabled === false, r.body);
+    const kOff = await sendTo('No Link');
+    check('with booking off, messages go out without a link', kOff.sent.status === 200 && kOff.links.length === 0, [kOff.sent.status, kOff.links.length]);
+    r = await pubPost(k9.link.token, { startAt: capDays[1].slots[0].startAt });
+    check('with booking off, existing links cannot book', r.status === 400, [r.status, r.body?.message]);
+    await call('PUT', '/business/booking-settings', { token: A.token, body: { enabled: true } });
+    r = await call('PUT', '/business/booking-settings', { token: B.token, body: { capacity: 5 } });
+    const bs = await call('GET', '/business/booking-settings', { token: A.token });
+    check('one business\'s settings do not leak to another', r.status === 200 && bs.data.settings.capacity === 2, bs.data);
+
+    // ── campaigns carry links too
+    const campRes = await call('POST', '/campaigns', { token: A.token, body: { label: 'Link Camp', messageBody: 'Festival offer', channels: ['sms'], scheduledAt: new Date().toISOString() } });
+    const cl = await pool.query(`SELECT context, reminder_id, campaign_id FROM booking_links WHERE campaign_id = $1`, [campRes.data?.id]);
+    const cLog = await pool.query(`SELECT message_body FROM message_log WHERE campaign_id = $1 LIMIT 1`, [campRes.data?.id]);
+    check('campaign messages each get their own link, tagged as a campaign', cl.rows.length === campRes.data.sent && cl.rows.length > 0 && cl.rows.every(x => x.context.kind === 'campaign' && x.context.category === 'marketing' && !x.reminder_id), [cl.rows.length, campRes.data?.sent]);
+    check('campaign audit log includes the link', /Book your appointment: http/.test(cLog.rows[0]?.message_body || ''), cLog.rows[0]);
+
+    // ── analytics
+    r = await call('GET', '/analytics/followups?days=30', { token: A.token });
+    const sms = r.data?.by_channel?.find(x => x.key === 'sms');
+    check('follow-up analytics: by channel with sent, clicked, booked', r.status === 200 && sms && sms.sent >= 8 && sms.clicked >= 1 && sms.booked >= 3 && sms.booked <= sms.sent, r.data);
+    check('analytics totals add up', r.data.totals.sent === r.data.by_channel.reduce((n, c) => n + c.sent, 0) && r.data.totals.booked === r.data.by_channel.reduce((n, c) => n + c.booked, 0));
+    check('analytics slice by kind, reminder type and hour', r.data.by_kind.some(x => x.key === 'campaign') && r.data.by_kind.some(x => x.key === 'reminder') && r.data.by_reminder_type.some(x => x.key === 'Checkup Due') && r.data.by_send_hour.length >= 1, [r.data.by_kind, r.data.by_send_hour]);
+    check('analytics counts appointments by origin', r.data.appointments.from_followups >= 3 && r.data.appointments.added_by_hand >= 1, r.data.appointments);
+    check('average time to book is a number', sms.avg_hours_to_book === null || typeof sms.avg_hours_to_book === 'number');
+    r = await call('GET', '/analytics/followups', { token: B.token });
+    check('another business sees none of this', r.status === 200 && r.data.totals.sent === 0 && r.data.by_channel.length === 0, r.data?.totals);
+    r = await call('GET', '/analytics/followups?days=abc', { token: A.token });
+    check('junk days param falls back safely', r.status === 200 && r.data.days === 90, r.data?.days);
+  }
+  function bCustEntityPlaceholder() { return '00000000-0000-4000-8000-000000000000'; }
+
+  // ───────────────────────────────────────────────────────────────
   section('Analytics / dashboard endpoints');
   {
     for (const [name, tok] of [['populated business A', A.token], ['brand-new empty business', (await register('E', 'pest_control')).token]]) {

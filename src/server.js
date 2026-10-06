@@ -24,6 +24,7 @@ const analyticsRoutes    = require('./routes/analytics');
 const campaignRoutes     = require('./routes/campaigns');
 const emailAuthRoutes    = require('./routes/emailAuth');
 const { publicRouter: checkinPublicRoutes, businessRouter: businessRoutes } = require('./routes/checkin');
+const { publicRouter: bookPublicRoutes, appointmentsRouter, settingsRouter: bookingSettingsRoutes } = require('./routes/booking');
 
 const app     = express();
 const VERSION = process.env.API_VERSION || 'v1';
@@ -99,6 +100,9 @@ app.use(`/api/${VERSION}/campaigns`,      campaignRoutes);
 app.use(`/api/${VERSION}/email-auth`,     emailAuthRoutes);
 app.use(`/api/${VERSION}/public/checkin`, checkinPublicRoutes);
 app.use(`/api/${VERSION}/business`,       businessRoutes);
+app.use(`/api/${VERSION}/business`,       bookingSettingsRoutes);
+app.use(`/api/${VERSION}/public/book`,    bookPublicRoutes);
+app.use(`/api/${VERSION}/appointments`,   appointmentsRouter);
 
 // ─── Health Check ─────────────────────────────────────────────────
 app.get('/health', async (req, res) => {

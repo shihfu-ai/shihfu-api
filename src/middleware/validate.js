@@ -189,6 +189,44 @@ const schemas = {
     scheduledAt: Joi.date().required(),
   }),
 
+  // Appointment booking
+  bookingSettings: Joi.object({
+    enabled:        Joi.boolean(),
+    days:           Joi.array().items(Joi.number().integer().min(0).max(6)).unique().min(1),
+    open:           Joi.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/),
+    close:          Joi.string().pattern(/^([01]\d|2[0-3]):[0-5]\d$/),
+    slotMinutes:    Joi.number().valid(15, 20, 30, 45, 60, 90, 120),
+    capacity:       Joi.number().integer().min(1).max(50),
+    maxDaysAhead:   Joi.number().integer().min(1).max(90),
+    minNoticeHours: Joi.number().integer().min(0).max(72),
+  }).min(1),
+
+  publicBook: Joi.object({
+    startAt:     Joi.date().iso().required(),
+    serviceType: Joi.string().trim().max(120).allow('', null),
+    notes:       Joi.string().trim().max(300).allow('', null),
+  }),
+
+  createAppointment: Joi.object({
+    customerId:  Joi.string().uuid().required(),
+    entityId:    Joi.string().uuid().allow(null),
+    startAt:     Joi.date().iso().required(),
+    durationMin: Joi.number().integer().min(5).max(480).default(30),
+    serviceType: Joi.string().trim().max(120).allow('', null),
+    notes:       Joi.string().trim().max(500).allow('', null),
+  }),
+
+  updateAppointment: Joi.object({
+    status: Joi.string().valid('booked', 'completed', 'cancelled', 'no_show'),
+    notes:  Joi.string().trim().max(500).allow(''),
+  }).min(1),
+
+  appointmentQuery: Joi.object({
+    page:  Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(25),
+    range: Joi.string().valid('upcoming', 'past', 'all').default('upcoming'),
+  }),
+
   // Query params
   listQuery: Joi.object({
     page:     Joi.number().integer().min(1).default(1),

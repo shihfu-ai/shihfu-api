@@ -185,7 +185,7 @@ router.post('/:id/send', async (req, res) => {
       `, [
         businessId, reminder.customer_id, id, reminder.channel,
         reminder.channel === 'email' ? reminder.email : reminder.phone,
-        messageBody,
+        sendResult.sentBody || messageBody,
         sendResult.provider, sendResult.providerId,
         sendResult.success ? 'sent' : 'failed',
       ]);
@@ -246,7 +246,7 @@ router.post('/send-overdue', authorize('owner', 'manager'), async (req, res) => 
         `, [
           businessId, reminder.customer_id, reminder.id, reminder.channel,
           reminder.channel === 'email' ? reminder.email : reminder.phone,
-          messageBody, result.provider, result.providerId,
+          result.sentBody || messageBody, result.provider, result.providerId,
           result.success ? 'sent' : 'failed',
         ]);
       });

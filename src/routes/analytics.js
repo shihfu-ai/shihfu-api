@@ -153,4 +153,72 @@ router.get('/dashboard', async (req, res) => {
   }
 });
 
+// ─── GET /analytics/followups?days=90 ─────────────────────────────
+// How well follow-up messages convert, sliced by what the business can
+// act on (channel, message type, time of day). Built from booking links:
+// sent -> opened the booking page -> booked. "Returned" is the looser
+// signal: any service logged within 14 days of the message, whether or
+// not the customer used the link (only counted once 14 days have passed).
+router.get('/followups', async (req, res) => {
+  const businessId = req.user.businessId;
+  const days = Math.min(365, Math.max(7, parseInt(req.query.days, 10) || 90));
+  try {
+    const base = `
+      WITH l AS (
+        SELECT bl.*,
+          (bl.sent_at <= NOW() - INTERVAL '14 days') AS matured,
+          EXISTS (
+            SELECT 1 FROM service_events se
+            WHERE se.customer_id = bl.customer_id
+              AND se.event_date >= (bl.sent_at AT TIME ZONE 'Asia/Kolkata')::date
+              AND se.event_date <= (bl.sent_at AT TIME ZONE 'Asia/Kolkata')::date + 14
+          ) AS returned
+        FROM booking_links bl
+        WHERE bl.business_id = $1 AND bl.sent_at IS NOT NULL
+          AND bl.sent_at >= NOW() - ($2 || ' days')::interval
+      )`;
+    const cols = `
+        COUNT(*)                                        AS sent,
+        COUNT(first_clicked_at)                         AS clicked,
+        COUNT(booked_at)                                AS booked,
+        COUNT(*) FILTER (WHERE matured)                 AS matured,
+        COUNT(*) FILTER (WHERE matured AND returned)    AS returned,
+        ROUND((AVG(EXTRACT(EPOCH FROM (booked_at - sent_at)) / 3600)
+              FILTER (WHERE booked_at IS NOT NULL))::numeric, 1) AS avg_hours_to_book`;
+    const group = (expr, extra = '') => query(`${base} SELECT ${expr} AS key, ${cols} FROM l ${extra} GROUP BY 1 ORDER BY sent DESC`, [businessId, String(days)]);
+
+    const [byChannel, byKind, byType, byHour, appts] = await Promise.all([
+      group('channel'),
+      group("context->>'kind'"),
+      group("COALESCE(context->>'reminder_type', 'n/a')", "WHERE context->>'kind' = 'reminder'"),
+      group("(context->>'send_hour_ist')::int"),
+      query(`
+        SELECT COUNT(*) FILTER (WHERE source = 'followup_link') AS from_followups,
+               COUNT(*) FILTER (WHERE source = 'manual')        AS added_by_hand
+        FROM appointments
+        WHERE business_id = $1 AND created_at >= NOW() - ($2 || ' days')::interval AND status <> 'cancelled'
+      `, [businessId, String(days)]),
+    ]);
+
+    const num = (r) => ({ ...r, sent: +r.sent, clicked: +r.clicked, booked: +r.booked, matured: +r.matured, returned: +r.returned,
+                          avg_hours_to_book: r.avg_hours_to_book === null ? null : Number(r.avg_hours_to_book) });
+    const channels = byChannel.rows.map(num);
+    const totals = channels.reduce((t, c) => ({
+      sent: t.sent + c.sent, clicked: t.clicked + c.clicked, booked: t.booked + c.booked,
+      matured: t.matured + c.matured, returned: t.returned + c.returned,
+    }), { sent: 0, clicked: 0, booked: 0, matured: 0, returned: 0 });
+
+    return R.success(res, {
+      days, totals, by_channel: channels,
+      by_kind: byKind.rows.map(num),
+      by_reminder_type: byType.rows.map(num).slice(0, 10),
+      by_send_hour: byHour.rows.map(num).sort((a, b) => a.key - b.key),
+      appointments: { from_followups: +appts.rows[0].from_followups, added_by_hand: +appts.rows[0].added_by_hand },
+    });
+  } catch (err) {
+    logger.error('Follow-up analytics error', { error: err.message });
+    return R.error(res);
+  }
+});
+
 module.exports = router;
